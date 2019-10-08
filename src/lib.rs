@@ -95,4 +95,7 @@ pub use util::key::PublicKey;
 pub use util::merkleblock::MerkleBlock;
 
 // elements:
+pub use blockdata::confidential::Asset as ConfidentialAsset;
+pub use blockdata::confidential::Nonce as ConfidentialNone;
+pub use blockdata::confidential::Value as ConfidentialValue;
 pub use util::issuance::AssetId;
