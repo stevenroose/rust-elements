@@ -20,21 +20,198 @@
 //! these blocks and the blockchain.
 //!
 
-use hashes::{sha256d, Hash};
+use std::io;
+
+use hashes::{sha256d, sha256, Hash};
+use hashes::HashEngine;
 
 use util;
-use util::Error::{BlockBadTarget, BlockBadProofOfWork};
 use util::hash::{ElementsHash, MerkleRoot, bitcoin_merkle_root};
-use util::uint::Uint256;
-use consensus::encode::Encodable;
-use network::constants::Network;
+use consensus::encode::{self, Decodable, Encodable};
 use blockdata::transaction::Transaction;
-use blockdata::constants::max_target;
-use hashes::HashEngine;
+use blockdata::script::Script;
+use blockdata::dynafed;
+
+/// Data related to block signatures
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum ExtData {
+    /// Liquid v1-style static `signblockscript` and witness
+    Proof {
+        /// Block "public key"
+        challenge: Script,
+        /// Satisfying witness to the above challenge, or nothing
+        solution: Script,
+    },
+    /// Dynamic federations
+    Dynafed {
+        /// Current dynamic federation parameters
+        current: dynafed::Params,
+        /// Proposed dynamic federation parameters
+        proposed: dynafed::Params,
+        /// Witness satisfying the current blocksigning script
+        signblock_witness: Vec<Vec<u8>>,
+    },
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for ExtData {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de;
+
+        enum Enum { Unknown, Challenge, Solution, Current, Proposed, Witness }
+        struct EnumVisitor;
+
+        impl<'de> de::Visitor<'de> for EnumVisitor {
+            type Value = Enum;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a field name")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    "challenge" => Ok(Enum::Challenge),
+                    "solution" => Ok(Enum::Solution),
+                    "current" => Ok(Enum::Current),
+                    "proposed" => Ok(Enum::Proposed),
+                    "signblock_witness" => Ok(Enum::Witness),
+                    _ => Ok(Enum::Unknown),
+                }
+            }
+        }
+
+        impl<'de> Deserialize<'de> for Enum {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                d.deserialize_str(EnumVisitor)
+            }
+        }
+
+        struct Visitor;
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = ExtData;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("block header extra data")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut challenge = None;
+                let mut solution = None;
+                let mut current = None;
+                let mut proposed = None;
+                let mut witness = None;
+
+                loop {
+                    match map.next_key::<Enum>()? {
+                        Some(Enum::Unknown) => {
+                            map.next_value::<de::IgnoredAny>()?;
+                        },
+                        Some(Enum::Challenge) => challenge = Some(map.next_value()?),
+                        Some(Enum::Solution) => solution = Some(map.next_value()?),
+                        Some(Enum::Current) => current = Some(map.next_value()?),
+                        Some(Enum::Proposed) => proposed = Some(map.next_value()?),
+                        Some(Enum::Witness) => witness = Some(map.next_value()?),
+                        None => { break; }
+                    }
+                }
+
+                let challenge_missing = challenge.is_some();
+                if let (Some(chal), Some(soln)) = (challenge, solution) {
+                    Ok(ExtData::Proof {
+                        challenge: chal,
+                        solution: soln,
+                    })
+                } else if let (Some(cur), Some(prop), Some(wit))
+                    = (current, proposed, witness)
+                {
+                    Ok(ExtData::Dynafed {
+                        current: cur,
+                        proposed: prop,
+                        signblock_witness: wit,
+                    })
+                } else {
+                    if challenge_missing {
+                        Err(de::Error::missing_field("challenge"))
+                    } else {
+                        Err(de::Error::missing_field("solution"))
+                    }
+                }
+            }
+        }
+
+        static FIELDS: &'static [&'static str] = &[
+            "challenge",
+            "solution",
+            "current",
+            "proposed",
+            "signblock_witness",
+        ];
+        d.deserialize_struct("ExtData", FIELDS, Visitor)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for ExtData {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        match *self {
+            ExtData::Proof { ref challenge, ref solution } => {
+                let mut st = s.serialize_struct("ExtData", 2)?;
+                st.serialize_field("challenge", challenge)?;
+                st.serialize_field("solution", solution)?;
+                st.end()
+            },
+            ExtData::Dynafed { ref current, ref proposed, ref signblock_witness } => {
+                let mut st = s.serialize_struct("ExtData", 3)?;
+                st.serialize_field("current", current)?;
+                st.serialize_field("proposed", proposed)?;
+                st.serialize_field("signblock_witness", signblock_witness)?;
+                st.end()
+            },
+        }
+    }
+}
+
+impl Encodable for ExtData {
+    fn consensus_encode<S: io::Write>(&self, mut s: S) -> Result<usize, encode::Error> {
+        Ok(match *self {
+            ExtData::Proof {
+                ref challenge,
+                ref solution,
+            } => {
+                challenge.consensus_encode(&mut s)? +
+                solution.consensus_encode(&mut s)?
+            },
+            ExtData::Dynafed {
+                ref current,
+                ref proposed,
+                ref signblock_witness,
+            } => {
+                current.consensus_encode(&mut s)? +
+                proposed.consensus_encode(&mut s)? +
+                signblock_witness.consensus_encode(&mut s)?
+            },
+        })
+    }
+}
+
+impl Default for ExtData {
+    fn default() -> ExtData {
+        ExtData::Dynafed {
+            current: dynafed::Params::Null,
+            proposed: dynafed::Params::Null,
+            signblock_witness: vec![],
+        }
+    }
+}
 
 /// A block header, which contains all the block's information except
 /// the actual transactions
-#[derive(Copy, PartialEq, Eq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug, Default)]
 pub struct BlockHeader {
     /// The protocol version. Should always be 1.
     pub version: u32,
@@ -44,11 +221,60 @@ pub struct BlockHeader {
     pub merkle_root: sha256d::Hash,
     /// The timestamp of the block, as claimed by the miner
     pub time: u32,
-    /// The target value below which the blockhash must lie, encoded as a
-    /// a float (with well-defined rounding, of course)
-    pub bits: u32,
-    /// The nonce, selected to obtain a low enough blockhash
-    pub nonce: u32,
+    /// Block height
+    pub height: u32,
+    /// Block signature and dynamic federation-related data
+    pub ext: ExtData,
+}
+serde_struct_impl!(BlockHeader, version, prev_blockhash, merkle_root, time, height, ext);
+
+impl Encodable for BlockHeader {
+    fn consensus_encode<S: io::Write>(&self, mut s: S) -> Result<usize, encode::Error> {
+        let version = if let ExtData::Dynafed { .. } = self.ext {
+            self.version | 0x8000_0000
+        } else {
+            self.version
+        };
+
+        Ok(version.consensus_encode(&mut s)? +
+        self.prev_blockhash.consensus_encode(&mut s)? +
+        self.merkle_root.consensus_encode(&mut s)? +
+        self.time.consensus_encode(&mut s)? +
+        self.height.consensus_encode(&mut s)? +
+        self.ext.consensus_encode(&mut s)?)
+    }
+}
+
+impl Decodable for BlockHeader {
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
+        let mut version: u32 = Decodable::consensus_decode(&mut d)?;
+        let is_dyna = if version >> 31 == 1 {
+            version &= 0x7fff_ffff;
+            true
+        } else {
+            false
+        };
+
+        Ok(BlockHeader {
+            version: version,
+            prev_blockhash: Decodable::consensus_decode(&mut d)?,
+            merkle_root: Decodable::consensus_decode(&mut d)?,
+            time: Decodable::consensus_decode(&mut d)?,
+            height: Decodable::consensus_decode(&mut d)?,
+            ext: if is_dyna {
+                ExtData::Dynafed {
+                    current: Decodable::consensus_decode(&mut d)?,
+                    proposed: Decodable::consensus_decode(&mut d)?,
+                    signblock_witness: Decodable::consensus_decode(&mut d)?,
+                }
+            } else {
+                ExtData::Proof {
+                    challenge: Decodable::consensus_decode(&mut d)?,
+                    solution: Decodable::consensus_decode(&mut d)?,
+                }
+            },
+        })
+    }
 }
 
 /// A Bitcoin block, which is a collection of transactions with an attached
@@ -60,16 +286,17 @@ pub struct Block {
     /// List of transactions contained in the block
     pub txdata: Vec<Transaction>
 }
+impl_consensus_encoding!(Block, header, txdata);
+serde_struct_impl!(Block, header, txdata);
 
 impl Block {
     /// check if merkle root of header matches merkle root of the transaction list
-    pub fn check_merkle_root (&self) -> bool {
+    pub fn check_merkle_root(&self) -> bool {
         self.header.merkle_root == self.merkle_root()
     }
 
     /// check if witness commitment in coinbase is matching the transaction list
     pub fn check_witness_commitment(&self) -> bool {
-
         // witness commitment is optional if there are no transactions using SegWit in the block
         if self.txdata.iter().all(|t| t.input.iter().all(|i| i.witness.is_empty())) {
             return true;
@@ -84,9 +311,9 @@ impl Block {
                         o.script_pubkey[0..6] == [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed] }) {
                     let commitment = sha256d::Hash::from_slice(&coinbase.output[pos].script_pubkey.as_bytes()[6..38]).unwrap();
                     // witness reserved value is in coinbase input witness
-                    if coinbase.input[0].witness.len() == 1 && coinbase.input[0].witness[0].len() == 32 {
+                    if coinbase.input[0].witness.script_witness.len() == 1 && coinbase.input[0].witness.script_witness[0].len() == 32 {
                         let witness_root = self.witness_root();
-                        return commitment == Self::compute_witness_commitment(&witness_root, coinbase.input[0].witness[0].as_slice())
+                        return commitment == Self::compute_witness_commitment(&witness_root, coinbase.input[0].witness.script_witness[0].as_slice())
                     }
                 }
             }
@@ -95,7 +322,7 @@ impl Block {
     }
 
     /// compute witness commitment for the transaction list
-    pub fn compute_witness_commitment (witness_root: &sha256d::Hash, witness_reserved_value: &[u8]) -> sha256d::Hash {
+    pub fn compute_witness_commitment(witness_root: &sha256d::Hash, witness_reserved_value: &[u8]) -> sha256d::Hash {
         let mut encoder = sha256d::Hash::engine();
         witness_root.consensus_encode(&mut encoder).unwrap();
         encoder.input(witness_reserved_value);
@@ -117,83 +344,70 @@ impl MerkleRoot for Block {
 }
 
 impl BlockHeader {
-    /// Computes the target [0, T] that a blockhash must land in to be valid
-    pub fn target(&self) -> Uint256 {
-        // This is a floating-point "compact" encoding originally used by
-        // OpenSSL, which satoshi put into consensus code, so we're stuck
-        // with it. The exponent needs to have 3 subtracted from it, hence
-        // this goofy decoding code:
-        let (mant, expt) = {
-            let unshifted_expt = self.bits >> 24;
-            if unshifted_expt <= 3 {
-                ((self.bits & 0xFFFFFF) >> (8 * (3 - unshifted_expt as usize)), 0)
-            } else {
-                (self.bits & 0xFFFFFF, 8 * ((self.bits >> 24) - 3))
+    /// Returns true if this is a block with dynamic federations enabled.
+    pub fn is_dynafed(&self) -> bool {
+        if let ExtData::Dynafed { .. } = self.ext {
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove the witness data of the block header.
+    /// This is all the data that can be removed without changing
+    /// the block hash.
+    pub fn clear_witness(&mut self) {
+        match &mut self.ext {
+            &mut ExtData::Proof { ref mut solution, .. } => {
+                *solution = Script::new();
+            },
+            &mut ExtData::Dynafed { ref mut signblock_witness, .. } => {
+                signblock_witness.clear();
+            },
+        }
+    }
+
+    /// Calculate the root of the dynafed params. Returns [None] when not dynafed.
+    pub fn calculate_dynafed_params_root(&self) -> Option<sha256::Midstate> {
+        match self.ext {
+            ExtData::Proof { .. } => None,
+            ExtData::Dynafed { ref current, ref proposed, .. } => {
+                let leaves = [
+                    current.calculate_root().into_inner(),
+                    proposed.calculate_root().into_inner(),
+                ];
+                Some(util::fast_merkle_root(&leaves[..]))
             }
-        };
-
-        // The mantissa is signed but may not be negative
-        if mant > 0x7FFFFF {
-            Default::default()
-        } else {
-            Uint256::from_u64(mant as u64).unwrap() << (expt as usize)
         }
-    }
-
-    /// Computes the target value in float format from Uint256 format.
-    pub fn compact_target_from_u256(value: &Uint256) -> u32 {
-        let mut size = (value.bits() + 7) / 8;
-        let mut compact = if size <= 3 {
-            (value.low_u64() << (8 * (3 - size))) as u32
-        } else {
-            let bn = *value >> (8 * (size - 3));
-            bn.low_u32()
-        };
-
-        if (compact & 0x00800000) != 0 {
-            compact >>= 8;
-            size += 1;
-        }
-
-        compact | (size << 24) as u32
-    }
-
-    /// Compute the popular "difficulty" measure for mining
-    pub fn difficulty(&self, network: Network) -> u64 {
-        (max_target(network) / self.target()).low_u64()
-    }
-
-    /// Checks that the proof-of-work for the block is valid.
-    pub fn validate_pow(&self, required_target: &Uint256) -> Result<(), util::Error> {
-        use byteorder::{ByteOrder, LittleEndian};
-
-        let target = &self.target();
-        if target != required_target {
-            return Err(BlockBadTarget);
-        }
-        let data: [u8; 32] = self.elements_hash().into_inner();
-        let mut ret = [0u64; 4];
-        LittleEndian::read_u64_into(&data, &mut ret);
-        let hash = &Uint256(ret);
-        if hash <= target { Ok(()) } else { Err(BlockBadProofOfWork) }
-    }
-
-    /// Returns the total work of the block
-    pub fn work(&self) -> Uint256 {
-        // 2**256 / (target + 1) == ~target / (target+1) + 1    (eqn shamelessly stolen from bitcoind)
-        let mut ret = !self.target();
-        let mut ret1 = self.target();
-        ret1.increment();
-        ret = ret / ret1;
-        ret.increment();
-        ret
     }
 }
 
 impl ElementsHash for BlockHeader {
     fn elements_hash(&self) -> sha256d::Hash {
-        use consensus::encode::serialize;
-        sha256d::Hash::hash(&serialize(self))
+
+        let version = if let ExtData::Dynafed { .. } = self.ext {
+            self.version | 0x8000_0000
+        } else {
+            self.version
+        };
+
+        // Everything except the signblock witness goes into the hash
+        let mut enc = sha256d::Hash::engine();
+        version.consensus_encode(&mut enc).unwrap();
+        self.prev_blockhash.consensus_encode(&mut enc).unwrap();
+        self.merkle_root.consensus_encode(&mut enc).unwrap();
+        self.time.consensus_encode(&mut enc).unwrap();
+        self.height.consensus_encode(&mut enc).unwrap();
+        match self.ext {
+            ExtData::Proof { ref challenge, .. } => {
+                challenge.consensus_encode(&mut enc).unwrap();
+            },
+            ExtData::Dynafed { ref current, ref proposed, .. } => {
+                current.consensus_encode(&mut enc).unwrap();
+                proposed.consensus_encode(&mut enc).unwrap();
+            },
+        }
+        sha256d::Hash::from_engine(enc)
     }
 }
 
@@ -203,81 +417,360 @@ impl ElementsHash for Block {
     }
 }
 
-impl_consensus_encoding!(BlockHeader, version, prev_blockhash, merkle_root, time, bits, nonce);
-impl_consensus_encoding!(Block, header, txdata);
-serde_struct_impl!(BlockHeader, version, prev_blockhash, merkle_root, time, bits, nonce);
-serde_struct_impl!(Block, header, txdata);
-
 #[cfg(test)]
 mod tests {
-    use hex::decode as hex_decode;
-
-    use blockdata::block::{Block, BlockHeader};
-    use consensus::encode::{deserialize, serialize};
-    use util::hash::MerkleRoot;
+    use blockdata::block::{Block, ExtData};
+	use blockdata::dynafed;
+	use util::hash::ElementsHash;
 
     #[test]
-    fn block_test() {
-        let some_block = hex_decode("010000004ddccd549d28f385ab457e98d1b11ce80bfea2c5ab93015ade4973e400000000bf4473e53794beae34e64fccc471dace6ae544180816f89591894e0f417a914cd74d6e49ffff001d323b3a7b0201000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0804ffff001d026e04ffffffff0100f2052a0100000043410446ef0102d1ec5240f0d061a4246c1bdef63fc3dbab7733052fbbf0ecd8f41fc26bf049ebb4f9527f374280259e7cfa99c48b0e3f39c51347a19a5819651503a5ac00000000010000000321f75f3139a013f50f315b23b0c9a2b6eac31e2bec98e5891c924664889942260000000049483045022100cb2c6b346a978ab8c61b18b5e9397755cbd17d6eb2fe0083ef32e067fa6c785a02206ce44e613f31d9a6b0517e46f3db1576e9812cc98d159bfdaf759a5014081b5c01ffffffff79cda0945903627c3da1f85fc95d0b8ee3e76ae0cfdc9a65d09744b1f8fc85430000000049483045022047957cdd957cfd0becd642f6b84d82f49b6cb4c51a91f49246908af7c3cfdf4a022100e96b46621f1bffcf5ea5982f88cef651e9354f5791602369bf5a82a6cd61a62501fffffffffe09f5fe3ffbf5ee97a54eb5e5069e9da6b4856ee86fc52938c2f979b0f38e82000000004847304402204165be9a4cbab8049e1af9723b96199bfd3e85f44c6b4c0177e3962686b26073022028f638da23fc003760861ad481ead4099312c60030d4cb57820ce4d33812a5ce01ffffffff01009d966b01000000434104ea1feff861b51fe3f5f8a3b12d0f4712db80e919548a80839fc47c6a21e66d957e9c5d8cd108c7a2d2324bad71f9904ac0ae7336507d785b17a2c115e427a32fac00000000").unwrap();
-        let cutoff_block = hex_decode("010000004ddccd549d28f385ab457e98d1b11ce80bfea2c5ab93015ade4973e400000000bf4473e53794beae34e64fccc471dace6ae544180816f89591894e0f417a914cd74d6e49ffff001d323b3a7b0201000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0804ffff001d026e04ffffffff0100f2052a0100000043410446ef0102d1ec5240f0d061a4246c1bdef63fc3dbab7733052fbbf0ecd8f41fc26bf049ebb4f9527f374280259e7cfa99c48b0e3f39c51347a19a5819651503a5ac00000000010000000321f75f3139a013f50f315b23b0c9a2b6eac31e2bec98e5891c924664889942260000000049483045022100cb2c6b346a978ab8c61b18b5e9397755cbd17d6eb2fe0083ef32e067fa6c785a02206ce44e613f31d9a6b0517e46f3db1576e9812cc98d159bfdaf759a5014081b5c01ffffffff79cda0945903627c3da1f85fc95d0b8ee3e76ae0cfdc9a65d09744b1f8fc85430000000049483045022047957cdd957cfd0becd642f6b84d82f49b6cb4c51a91f49246908af7c3cfdf4a022100e96b46621f1bffcf5ea5982f88cef651e9354f5791602369bf5a82a6cd61a62501fffffffffe09f5fe3ffbf5ee97a54eb5e5069e9da6b4856ee86fc52938c2f979b0f38e82000000004847304402204165be9a4cbab8049e1af9723b96199bfd3e85f44c6b4c0177e3962686b26073022028f638da23fc003760861ad481ead4099312c60030d4cb57820ce4d33812a5ce01ffffffff01009d966b01000000434104ea1feff861b51fe3f5f8a3b12d0f4712db80e919548a80839fc47c6a21e66d957e9c5d8cd108c7a2d2324bad71f9904ac0ae7336507d785b17a2c115e427a32fac").unwrap();
+    fn elements_block() {
+        // Simple block with only coinbase output
+        let block: Block = hex_deserialize!(
+            "00000020a66e4a4baff69735267346d12e59e8a0da848b593813554deb16a6f3\
+             6cd035e9aab0e2451724598471dd4e45f0dca40ca5f4ac62e61957e50925af08\
+             59891fcc8842805b020000000151000102000000010100000000000000000000\
+             00000000000000000000000000000000000000000000ffffffff03520101ffff\
+             ffff0201230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a\
+             0d5de1b201000000000000000000016a01230f4f5d4b7c6fa845806ee4f67713\
+             459e1b69e8e60fcee2e4940c7a0d5de1b201000000000000000000266a24aa21\
+             a9ed94f15ed3a62165e4a0b99699cc28b48e19cb5bc1b1f47155db62d63f1e04\
+             7d45000000000000012000000000000000000000000000000000000000000000\
+             000000000000000000000000000000"
+        );
 
-        let prevhash = hex_decode("4ddccd549d28f385ab457e98d1b11ce80bfea2c5ab93015ade4973e400000000").unwrap();
-        let merkle = hex_decode("bf4473e53794beae34e64fccc471dace6ae544180816f89591894e0f417a914c").unwrap();
+        assert_eq!(
+            block.elements_hash().to_string(),
+            "287ca47e8da47eb8c28d870663450bb026922eadb30a1b2f8293e6e9d1ca5322"
+        );
+        assert_eq!(block.header.version, 0x20000000);
+        assert_eq!(block.header.height, 2);
+        assert_eq!(block.txdata.len(), 1);
 
-        let decode: Result<Block, _> = deserialize(&some_block);
-        let bad_decode: Result<Block, _> = deserialize(&cutoff_block);
+        // Block with 3 transactions ... the rangeproofs are very large :)
+        let block: Block = hex_deserialize!(
+            "000000207e3dba98460e4136659f0fccf3e59338dfe53ed5f094fb0bb94d771c\
+            48341854d875900105c87e5dd46c740cb1129c06f8f4007e868f61b25e37cffa9\
+            46c718d8742805b01000000015100030200000001010000000000000000000000\
+            000000000000000000000000000000000000000000ffffffff03510101fffffff\
+            f0201230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5d\
+            e1b2010000000000009b64001976a914608c0ea8194a8ceb57f0196f44a6b48a5\
+            4fc065988ac01230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e494\
+            0c7a0d5de1b201000000000000000000266a24aa21a9ed8f8a98e5623643b2416\
+            7266c2648ead4a50d18b0491c6f34e11398aaee0ca6e800000000000001200000\
+            00000000000000000000000000000000000000000000000000000000000000000\
+            00000020000000001eb04b68e9a26d116046c76e8ff47332fb71dda90ff4bef53\
+            70f25226d3bc09fc0000000000feffffff0201230f4f5d4b7c6fa845806ee4f67\
+            713459e1b69e8e60fcee2e4940c7a0d5de1b20100000002540bd71c001976a914\
+            48633e2c0ee9495dd3f9c43732c47f4702a362c888ac01230f4f5d4b7c6fa8458\
+            06ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b2010000000000000ce400\
+            0000000000020000000101f23ceddac67cfbbc997199daa651384d0746fb2a548\
+            2b8c8629ba8df4b788f75000000006b483045022100e0feb3e2f292000d67e24b\
+            821d87c9532230dac1de428d6a0068c9f416583abf02200e76f072788dd411b23\
+            27267cd91c6b1659809598cd4fae35be475efe1e4bbad01210201e15c23c02165\
+            2d07c1557b607ea0379fca0462aca840d6c33c4d4927524547feffffff030b604\
+            24a423335923c15ae387d95d4f80d944722020bfa55b9f0a0e67579e3c13c081c\
+            4f215239c77456d121eb73bd9914a9a6398fe369b4eb8f88a5f78e257fcaa3033\
+            01ee46349950886ae115c9556607fcda9381c2f72368f4b5286488c62aa0b0819\
+            76a9148bb6c4d5814d43fefb9e330575e326632136389c88ac0bd436b0539f549\
+            7af792d7cb281f09b73d8a5abc198b3ce6239d79e68893e5e5d0923899fd35071\
+            ba8a209d85b556d5747b6c35539c3b2f8631a27c0d477a1f45a603d1d350b8cbf\
+            900f7666da66541bf6252fc4c162141ad49c670884c93c57db6ba1976a9148c7a\
+            b6e0fca387d03643d4846f708bf39d47c1e988ac01230f4f5d4b7c6fa845806ee\
+            4f67713459e1b69e8e60fcee2e4940c7a0d5de1b2010000000000008e80000000\
+            0000000000000043010001dc65ae13f76fde4a7172e0fb380b1a5cc8dc88eaa06\
+            59e638a25eac8ae30d79bf93eb7e487eeee323e4ac8e3a2fe6523bdeba6acce32\
+            b9b085f2286174c04655fd6c0a6020000000000000000178ad016b3e5d8165423\
+            e56d8b37e3eaee96009b2f970043ccf65d61b5c3c1e1ef343e0c479bdba442717\
+            dc861c9591566010240b9d4607efb9252a5fcef05edf640e0bb6b606729246ad0\
+            7baa49d0d3b52042c65a03ca737744e45b2d2d6d177c36569ae9d6eb4437305b1\
+            69bbc59f85cabff3bc49a2d6d08c177cce3121a509d3c47961bd22e35c932b79d\
+            4ec5ccaf913fac04034bfebdadbc4ff3127af96344b02ee6b967bb08326cbe6a4\
+            e1c924485e64a8c0fdf70b98c99f38acaa15aa0adb2b5b7335ed5502443891bcd\
+            657310347cbd928f40f38f1dec087a2b947c9cf7d304798f77bbc4a2c843796b2\
+            d49acce91de4e88a0a9c261277df28ffc3320d7f7d64790f592ddded48a1068ef\
+            88271395fa5606389ef90856ddd6bd6710a8d27e0147983b5dde2a7efae44e83a\
+            d02a3c3da04be43d5f2c05c205f1e17b48554c2177670f46dbb6600bd2e6c75dd\
+            5ea2e1072c5f22483dcf05d8124e3f9063a5ddb179a29c23a2d15d6e89f2192f0\
+            3dae5938f66fcdcff000c5a96ffd2920f23881880af72153c96a56dd80c218bb4\
+            8b44a18e54a8050ff32c869c1264ee574cdb4002f86e0779c724d11dc4a768dbe\
+            c1bd22054886f1fdf2e7347e4c247b829159d1375f881c6ce0a5c4da8534000e7\
+            fec3a980afb1edc99b725c29de80f260dcf144c873bf589ae1812ef6cb05f2234\
+            f9c66c23e874a0d5d0dc52f2209e015bbcf74ee449a397f6b0318c915b7e58dea\
+            5904abbe35285e90ccf548ad1f3f52f60c3b19b3cd67644d633e68aef42d8ef17\
+            82f22a8edd0620f55f29070720ca7a078ac83e87b9ebd2783ecad17dd854ef1bb\
+            d319f1a6d3a1e4931f9097422f5a3c4af037b99e06c7610ee61102c6eea763af1\
+            08e9a16b93b2dc0891658d5c6a197df6aae9b306b2c895d21c79cb6cb6dd85b40\
+            18b0a9fe7468336e3907eb4adcaf930cacc97e8e951d2d6b25744a4143679bad1\
+            f31b210c9a2ed54b80d8f5d7dc1f1c985681534c1926920cd683d95dca7e8ea28\
+            5f9906d2e89cd8bfa76a98e38ee4b5152522d55f79610fe8d5278fe6ed5866b5d\
+            a4dcf330ea84307c34f30e1a66eb1934dafebb0074fc27c2ff73d8c0bae8416cc\
+            87bf611f81119aba9e2a911beaf3ac9507e621fc1ed1cf15dfb31408cf55e2bfd\
+            d2880db2d3489a336d6f8348347648d882f9f376331e469e809115c6cc82468f3\
+            63c910673e9ded172ded90a369e1cdd135676f623e11a1531ed221177812b1ef0\
+            c65e5ca92c0df8de7fe664710f3228a226e019c99607fe1395ecd5643e1c7ad8a\
+            132bf5131737cb970a7f0dabc00029755bf71b3f47bd69ba39b3ab104c74f0423\
+            9f4919dca1dfce7c9c41cba9d449073e106ebabe3c313b598ee8b11702ec46e9e\
+            e53fb9422f0326371898b8fa4c21a951684c687398e0bebd6f6fd91b829e8666b\
+            9a19a4273cfda0f34b8ecb902f7adc6539fb9a0cba6f87a63a957acfb2dfa1897\
+            3f4a3063668767b2be780311513c63f1814f082176f6a953f2ffaa49ec9b39fec\
+            c2eab603be7a969bb4c1dbebf8d39fa90f802d5ea52378b5025a19b64a8c2c2dd\
+            6a6133bd8d29730bd5724b5bf50c158b238d1137082937ad91a176aaf91577868\
+            db7581b457c917e612b242ce0065ad47e11dcdc1fc6158687142249bcf312497a\
+            547b6f43e795af7d4ae8cd022e44e417987e35e83de21e39dcdf86b97bd421e6e\
+            61881a432fa2284f20be80e32459443736b875d9036468ceb881589394441e2d1\
+            0aa10b6c93332951e8ba56f89fac70baf415b4511873c0f3e418ca4fe8954a28f\
+            1f7b5f590d34470119f694e2712f184882d90396c8e6aa850eaa3c2ae51990543\
+            638c46c59512167a2c5ad593532dc2142ffb6560476e4159213b9ef017ec75310\
+            d2e4624a405bb26f7192a485a94890674928c9caa4a5819ca4ddcba8fa71afc1a\
+            6baf63f039452c8fe994f8b63d58c876dfddd61a476345eaed4f66bdc0fcfc38d\
+            485c6a5b0e27d0fbc50427ff591ba38d63445c01642cfbd7d4c032f2546a6fe80\
+            bc3b598362502c552049523fe360c3bcf1cc572feb04386f97d55871dd8cea039\
+            3cdd964e724082adc98126e6f2fe1d576be4bf911e9aca70e35538175f8382bbc\
+            d614bbecc97c9607ef25da2ff08a6e5b6f76cbe9ccb0e0fdc3528e3e2c3675a5c\
+            897d295bb76524ec8a73a70b97909368f44d92f9aceaef0b03f3dafa1faa89fc6\
+            63a92da3c19b4952463fac0e825e78cf046e266cfb9975af72e9d50d2c2cafee8\
+            8fe2cecae2b1465fc07b280d83b66062dc9e7a372f81aec8e0bb9e97877814a5a\
+            6813c67746e35cd068d45d8664528bd00d5a306a5319e1bea7f38345da92d3a10\
+            d91476a26aed6b8441f0f72fbbad5d5e0f8ae5cabc9f4f08e6be7902b5c53632d\
+            b5264afee7422c87b3237a32d5213ad0eb807b61977d9d90666cbb0c70500526b\
+            0eb762c99351796db41166b0aa2f221b5607e0d629fac4e938488245c11557381\
+            a4f8addcc49913b11d42481cf8668e37bacbad4a20509e4fe4ccbcee7aea2909a\
+            2abe59052f7f28b9340cd92f69729d615b8d3b530941c0b30506498cd4e561a9c\
+            82d915266bb7115967bc76c5593c06d094bdf4294b868afc5fa52742d3bdbd593\
+            2df599f0e1187c49f0dba8679c771a514cc9da75e03506957800bf470d4a07c4b\
+            b8918d6085499bb8ceeaba23c0b465863327e9ab8b6b8cf8b3ca530ca7b02cfad\
+            f85437b750f305e8fbc8855c95bee8595a7e9e1f0993a03adbadc68665a18936c\
+            c99b6530b4518c0754990d7bfdfdac76f88cfcbcb7b3d9a71ee10cbd3a1bdbc2e\
+            50b642c1fef56511962f845bbec6eab727b1d4add335db8d80c4c07e8356ad05a\
+            dad68b012489fa5bb5d9019a667778ddf7f5edd80f1d3c4abd64397a89e554c80\
+            07809336ddc2b2e7d5219c39fdf39aad33b9350f6b18fe3b98c690b9068f36d4b\
+            7669530fd216373842fbf70fe9bbe80854b31eed4bd515d6caeb065d6c609846c\
+            9bfae1b3fce3db70b5bfb448ec69512e7f25019c789301b77a75f2a0f81c65ec2\
+            9f41bf96d597a00c310e8ba4b48ac82b5a735c1e83f22394eb2fc9b35d42a3553\
+            3c938f26290a5860175637982f1733c99be39c44ac4a09187406306bde2fd3d28\
+            e4e7bda73719912c338804dea03987757dac4d73def665e11da126f9414f71624\
+            a3b753797eb0472bd334094515c4f9fe57fdd8d185f22b4bf82e4b5f6b800870c\
+            ce19a0c8174dc11ee9f1cb9ffe0ac6f6fff1ebf7c915c7ae20172bb70390e3759\
+            912e0e0a4e83a0a2d2318f4386314a89f6438ccb331f89377ff7947fe4b24f788\
+            aef85c1656ca87ee41c959f1b09bde09f20c2a51ac481646b28e9b0fc2ff49cfe\
+            8cf28577bf5bf6f261f54f97fcd2875da4210c6dfe685450280b68e378d9a4862\
+            43cc682ed4ec747c37de1fde848e4a8f70498d22e40c462c469c884cd67330e77\
+            b694e759232313f31a1624e0e1960f23ddae47b68ff553d0de0910c8abe2e8e5f\
+            b063aa744ff77465fc731c7af79a84dcaa9b3f741a46dd3c932877d49242c6d88\
+            3e14392b8c4530986605812b636a73590ef437f27e40d1af37ed1cbd68fb4e9ca\
+            5b0b41e5daee0142c1bf59c9d71f6c19b25e6148dfbb9fb142107aabe3701e366\
+            11a7e0b13ea32d3c5f8a51f63c5f34415baa15f6ca77300eb323241ffe73c5acd\
+            97fcb682c21dc8911392979e9cb81be5218acf452b5b93f6681d323b7989fdd10\
+            efe6fe9e2ac88d0d76a4cf3ee45e3b5c430100014142c1fc7e8a658eff437594a\
+            25cf34d269556d8511918f27fdc7e9d6dd73f0e4790b91f225e9d131e6abb3dbf\
+            b66549a9aa57948fbd2f183fcd951b1d2305bffd6c0a602000000000000000016\
+            f5cdf9fb6c1b5e98a36befdc2c55bd4fd8793d554b2506f51c909362495e1216e\
+            e83cd270ddb0a00785600ba23bd3363f0798e3a7a117990415adec88e61be6517\
+            0bd587ab4d2ee38edb22a91e5c29afa397dd5a73465c51c6263f5fbde47fa801c\
+            e84464acc32589acaafadfe44d6558774b7085612a88f3424b6dca3c6f07217d1\
+            cbd5c41bda46a6a492a0119c1de4d25b58c94250bee3fba6b8223777535673a2f\
+            4da6af27598030f88144f408120f07ca9c98d5d9edcdf6cdc9073f118fce55e6c\
+            9d0be80b5e87992ddaa9c22053b3a00d42bdedc9768de25c0b37a5c4fb4e86710\
+            b33cebed5588d88adde607f6bca14f0279ce35126d403ffa50f288c87f528c197\
+            49ed43bd846c513fcd92c173fe76d8f2e69770439d3d075cb19b1094a42ee07ae\
+            1de197e8c136e2bc688a75a74db24adb0fbb73872dc80074f61c9cce9bd33861b\
+            dd921ee3edacab1d6e7cec325c172b6b6e82ada11687e4fc931225074dd1f20a0\
+            f9342dbce1fc3fdbf5bb6cb74ab6475e574e9f5f247a2f7e4fcfcc354d4da8c80\
+            66e574642c7fccbbb9ef0aa592ecab5366fe87eb8e14cd64aee34578aa48f68f8\
+            f4c5372df2c3fc429f5a3e39ef6c034c87f9c52b2ea35e28c7bf3be737c3817ef\
+            d6569466dc859e8ff8965c5249b6f045934d3d08b0ffd388aec58df8194ac2c4f\
+            ec2152942d2626595e65664b1fa33b5dae8ee796a840a56d885cbf7ae6483fad0\
+            5e507ada3f075ebce0d791b626c6dfe93f8492c4dd3b34aafc33d7644c5c8e38b\
+            fd8c19194f65be88fcb4538778632e489a626896372fdd2498b16e64daa7d3c5c\
+            fac688d6f9cdf3717261b0a1f25be1bdd6be6558ddb826fa04b5f668810a291ae\
+            a51a6f05ff7c34dcf81c74849a8015bad5e4e416989b10ef01de304775db725fa\
+            0b665f4330dc9c540dc29aab144837362a97d6bb0165cb3272338c2d32386cd95\
+            ee3e66d876b591a25a6907237523cf908f736d2fdc8e54ea8d9c7562697161d1f\
+            72fc4d7b775052415cd0e5ae5bdf6edfab5776b6ff75ce5e1f8f2beea6ec74252\
+            b63966cca58abd638279dc5c998a1068079f3e5dcc8a69165c304c3d8c362ccfa\
+            dab05ad12208a5655ab389eb727e8ed5f86b300331a13be26e2fbabf89fbfd2b9\
+            8481dd5edb52ed456a0e03a84b6f89761f91ff251412f5cfa286e35fb9f48ef0e\
+            044c4742b6e860a08767ecb80548c2f3df3b371cdb40e86dbe118f64e84faf45e\
+            cb78d73364e9e31e3412ca2a3fad0a35983370ea9e6264a222edd1fd4aca30e3c\
+            169d7ca2d07609262e786ecd019c1417a06b7dfa32a54e0897afdc6492f266115\
+            55cbff47dba3b76381f239d597a8f687669333e0b47b53d5bcc4fea1919490bad\
+            3c6f0b6a58a50aca7ddeb9745ead454e0a38d9486fb52aefe0dbb92bf7fd6c215\
+            078aba3482b11274ec8cddff92c359bbc6d20bd823ad0bbf859cfaadf8e775b3d\
+            37b3078319f46c6d2a112cf60a673fee467538c70f1687d97fbe9d9f8a0856061\
+            592a4e00b6d10e979e674dd2cd0ba8b853f733877cd508062d5f723d58d215ad6\
+            9c2be6be742496aef54eb87338622eb36a9bbc5a7a602d280a45e095b1e078dab\
+            54479e783a513c722066acaae44ccc15f9560da91ed053ec05c36d82f68097668\
+            76c45c4fbeb2321d50f48f7995437d0c5fc365974a571fb0352d28cb1cdbd21d6\
+            9fab576a2e68d6b881776027bcdb7f01be22b1c847d91f26e680ef6ab2c128a89\
+            b59432383d9bd661b0b01432cf8a25319426d38ac2e2114825f59b4250569c798\
+            b1094920bb31130728313ff56a6eef2e6c4b275215dce3786d0f9024952b5f572\
+            566c53597e7ef4ab1f75743e605a564054d667f48906b5481d924769ef65751e3\
+            49891d725a2c1bf8b102fea4c25c874d2fc2ce1bfec4b39bea76fbf7a28855725\
+            d52b595a4fc96892c3f1f961d46310ebd5221df729c02060035c559baf0fd7efa\
+            73a2213ca29642857aeb8ebf7efdf9d2f5c84746b6fc35ab355a8dca56e7dde48\
+            31e47ca1be6b62af30cfcf807c384e56ab84ff03bbe786251e6c4b932c9217bf6\
+            71046217bd0511fdc06aa69050c1480281e4843eb73d80095a2fb8e68a2c0c98c\
+            9aea637b99d87ad847a3a76d59ea308c751f9cb4a4fce2989822bd6ba2f901f09\
+            df647536dc30730ea3160dd35b8c6dcc9aa815b79ed492a8a299a298ccdf784b9\
+            b0211ca877ec1723817c98529acaa4d3727162b5740b0fc9b498dfb2212a3cbf0\
+            c63dc4f7663fafad7905643a792862b651e8497b0f0da632b897ecf9ee63f2b20\
+            b54fa5eb2f2e424dcce5a075f50b856af266655be3a815fc83ed8027508b25369\
+            76982196b160e2219ffdb5c7a56dd3e6b700860c711f4439dbf72973f4f26fe32\
+            60ec43a3446fe14444b9787d877e107be610147eec4a3574745e95a1f424aff06\
+            2f84c559d13b1e6b59e8dc2221515c229f07db8eb39c515a321d8bd07b1bd6c9a\
+            79dac6d951c04415553c7a2ce1eb77495c7f89c4d5b4cffd289435b69bc535850\
+            95083cc5a1b191781342266e204e1566aca8175e2ae84a8bd711d188b666dfb65\
+            a6442776d3e23c1b5192af09ec712537f2157d0ccbc1bb3b3a1969d9705671f16\
+            bdc266e615ad2e50a8cbd666f3ee7465cc430c6cd69d30c91e717b12f7094b6f0\
+            ef89134d6c1620d28d8f238c181146448b348e4ca2e93c737210350f18fb878fb\
+            91b70ecc5689e5b6101ecfc545f6a1c903115b0c6419c91a50fb2dbe2edd362f2\
+            815f0c75070974507c34130ac9b29747ff7efbe6e37ee4c62be3ecfedfa817fdf\
+            3309163aaff677775b77f0d288c9858cfe59cb0fa18afa591e7d574eaef43c82e\
+            79d71542c4177de4e5bd724b18cfd33c68530665728a9d5ef192772094acbf3d8\
+            85d5146c1634e74754e3fbcb94fa349eac8280cfd7d1f46a0813b57a83bd078b1\
+            f7cb5a60a59b59380fe04e1c600c33b33d1add69a9ff1be546f0ec5c0083979fc\
+            e940b23711f382ac0d011c1103f02cb6082c18e39cf7a9c3bf4c081f905ae7b87\
+            951a7880b57e934465ccd634e5a17fd8d8866abfdfebd33b2c3d2c5be58144900\
+            c04e9c18de0c80270660e62a3c185277555f89da4c41bd33cec1359f4ed21abdb\
+            586e1d97f720a92d16014d7f1822f1836f74c97cb7f7b38e073477c6ab064fde8\
+            35916c1e624de81f2ad90f6260073c5e1848582860f033630bde225821b39c257\
+            2b30c36adf8fdb8317c33df05f6413447f4985d12e9012629df09dc8f43373a6d\
+            0db4b0048453a6f1ec662472c77a30d5cf4ac7084f736d0d598c251f2aefc9860\
+            52fbf12a657885d7140ad36b07c63ab86388a2be12d943747f3f29ef9f2e11e14\
+            44cc873df0ed7826eef675389a0d5a0388a8504fe89c4791ea4a572bfd406d5f0\
+            1418b4f888c9a7a566e32811936bf6950bbf786b86c41c28f2045d31953fcd15f\
+            179e7bc00c72870890537921f7deff82270b0e44b88720aa738f60a85567deb7c\
+            90b0c2444467621e53e1c079436d31d3d0b34dd237fc281eb9d87175237a9a433\
+            142db4bb7f8c4cb6a34e2dc73f074045d216695ce88ef68e18564c935c9cbd902\
+            e939655c258de2ab78def8746bffd972083afce3b6881b7147262e1a44e022468\
+            9fafa1a3cb823c8da6eb7df091bec0638bf728b7b10aa95f2bce512ec8d325293\
+            8d2eb77b44ace7a2f976588032cac5af670f9e5ca25cb0721bc1baec26f9c3a9f\
+            41b02fb62997d6cb0a01314845e9d0e78139ea49f2ead8736e0000"
+        );
 
-        assert!(decode.is_ok());
-        assert!(bad_decode.is_err());
-        let real_decode = decode.unwrap();
-        assert_eq!(real_decode.header.version, 1);
-        assert_eq!(serialize(&real_decode.header.prev_blockhash), prevhash);
-        assert_eq!(real_decode.header.merkle_root, real_decode.merkle_root());
-        assert_eq!(serialize(&real_decode.header.merkle_root), merkle);
-        assert_eq!(real_decode.header.time, 1231965655);
-        assert_eq!(real_decode.header.bits, 486604799);
-        assert_eq!(real_decode.header.nonce, 2067413810);
-        // [test] TODO: check the transaction data
+        assert_eq!(
+            block.elements_hash().to_string(),
+            "e935d06cf3a616eb4d551338598b84daa0e8592ed14673263597f6af4b4a6ea6"
+        );
+        assert_eq!(block.header.version, 0x20000000);
+        assert_eq!(block.header.height, 1);
+        assert_eq!(block.txdata.len(), 3);
 
-        // should be also ok for a non-witness block as commitment is optional in that case
-        assert!(real_decode.check_witness_commitment());
+        // 2-of-3 signed block from Liquid integration tests
+        let block: Block = hex_deserialize!(
+            "0000002069de100c1bae40e1cf8819bd18282e4ca370f62123c8ea2c60836984\
+             ba052270ee0cb6e5458591ac157ad414a111db4d34cedffc22e096291f7b4b3c\
+             8de3f69f8d53815b03000000695221031c25c60ef342990d9bf75425c1dc2392\
+             b5e206268d9d35044b731735db230c38210319c5a32a8ae698aaf1246784f542\
+             31d8d20f81b91c31353214538b827d718c8d210399d55e0a7fb30281da074dfb\
+             bb2654cacc2d03289ba79feae702ad6dbb542aab53ae9000463044022029bbe1\
+             79c2f0d8e6d1576869cea19ef439d0e52373f7efab77cd6ccb551b29f6022042\
+             baa3c17fccfb265ee878059b6cb85d40b976a30495c6ca14b7ffe6d1d8757247\
+             3045022100da88bb6fa1ecf3060ad7c8347eaa1a7ef8c9ae27a8b0136cff9099\
+             94ca409f9e022068ddf3090bde1e04deda04f762eb35858d7dfc17e156bfc1c8\
+             131ca07a349dda01020000000101000000000000000000000000000000000000\
+             0000000000000000000000000000ffffffff03530101ffffffff02018dc25a05\
+             5e773e7e91d4678053ebc702cce47f07b29f3ebd7c4b34cd30fb240201000000\
+             000000000000016a018dc25a055e773e7e91d4678053ebc702cce47f07b29f3e\
+             bd7c4b34cd30fb240201000000000000000000266a24aa21a9ed94f15ed3a621\
+             65e4a0b99699cc28b48e19cb5bc1b1f47155db62d63f1e047d45000000000000\
+             0120000000000000000000000000000000000000000000000000000000000000\
+             00000000000000"
+        );
 
-        assert_eq!(serialize(&real_decode), some_block);
+        assert_eq!(
+            block.elements_hash().to_string(),
+            "bcc6eb2ab6c97b9b4590825b9136f100b22e090c0469818572b8b93926a79f28"
+        );
+        assert_eq!(block.header.version, 0x20000000);
+        if let ExtData::Proof { challenge, solution } = block.header.ext {
+            assert_eq!(challenge.len(), 1 + 3 * 34 + 2);
+            assert_eq!(solution.len(), 144);
+        } else {
+            panic!("dynafed test vector was parsed as non-dynafed");
+        }
     }
 
-    // Check testnet block 000000000000045e0b1660b6445b5e5c5ab63c9a4f956be7e1e69be04fa4497b
     #[test]
-    fn segwit_block_test() {
-        let segwit_block = hex_decode("000000202aa2f2ca794ccbd40c16e2f3333f6b8b683f9e7179b2c4d7490600000000000010bc26e70a2f672ad420a6153dd0c28b40a6002c55531bfc99bf8994a8e8f67e5503bd5750d4061a4ed90a700f010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff3603da1b0e00045503bd5704c7dd8a0d0ced13bb5785010800000000000a636b706f6f6c122f4e696e6a61506f6f6c2f5345475749542fffffffff02b4e5a212000000001976a914876fbb82ec05caa6af7a3b5e5a983aae6c6cc6d688ac0000000000000000266a24aa21a9edf91c46b49eb8a29089980f02ee6b57e7d63d33b18b4fddac2bcd7db2a3983704012000000000000000000000000000000000000000000000000000000000000000000000000001000000017e4f81175332a733e26d4ba4e29f53f67b7a5d7c2adebb276e447ca71d130b55000000006b483045022100cac809cd1a3d9ad5d5e31a84e2e1d8ec5542841e4d14c6b52e8b38cbe1ff1728022064470b7fb0c2efeccb2e84bfa36ec5f9e434c84b1101c00f7ee32f726371b7410121020e62280798b6b8c37f068df0915b0865b63fabc401c2457cbc3ef96887dd3647ffffffff02ca2f780c000000001976a914c6b5545b3592cb477d709896fa705592c9b6113a88ac663b2a06000000001976a914e7c1345fc8f87c68170b3aa798a956c2fe6a9eff88ac0000000001000000011e99f5a785e677e017d36b50aa4fd10010ffd039f38f42f447ca8895250e121f01000000d90047304402200d3d296ad641a281dd5c0d68b9ab0d1ad5f7052bec148c1fb81fb1ba69181ec502201a372bb16fb8e054ee9bef41e300d292153830f841a4db0ab7f7407f6581b9bc01473044022002584f313ae990236b6bebb82fbbb006a2b02a448dd5c93434428991eae960d60220491d67d2660c4dde19025cf86e5164a559e2c79c3b98b40e146fab974acd24690147522102632178d046673c9729d828cfee388e121f497707f810c131e0d3fc0fe0bd66d62103a0951ec7d3a9da9de171617026442fcd30f34d66100fab539853b43f508787d452aeffffffff0240420f000000000017a9140ffdcf96700455074292a821c74922e8652993998788997bc60000000017a9148ce5408cfeaddb7ccb2545ded41ef478109454848700000000010000000113100b09e6a78d63ec4850654ab0f68806de29710b09172eddfef730652b155501000000da00473044022015389408e3446a3f36a05060e0e4a3c8b92ff3901ba2511aa944ec91a537a1cb022045a33b6ec47605b1718ed2e753263e54918edbf6126508ff039621fb928d28a001483045022100bb952fde81f216f7063575c0bb2bedc050ce08c96d9b437ea922f5eb98c882da02201b7cbf3a2f94ea4c5eb7f0df3af2ebcafa8705af7f410ab5d3d4bac13d6bc6120147522102632178d046673c9729d828cfee388e121f497707f810c131e0d3fc0fe0bd66d62103a0951ec7d3a9da9de171617026442fcd30f34d66100fab539853b43f508787d452aeffffffff0240420f000000000017a914d3db9a20312c3ab896a316eb108dbd01e47e17d687e0ba7ac60000000017a9148ce5408cfeaddb7ccb2545ded41ef47810945484870000000001000000016e3cca1599cde54878e2f27f434df69df0afd1f313cb6e38c08d3ffb57f97a6c01000000da0048304502210095623b70ec3194fa4037a1c1106c2580caedc390e25e5b330bbeb3111e8184bc02205ae973c4a4454be2a3a03beb66297143c1044a3c4743742c5cdd1d516a1ad3040147304402202f3d6d89996f5b42773dd6ebaf367f1af1f3a95c7c7b487ec040131c40f4a4a30220524ffbb0b563f37b3eb1341228f792e8f84111b7c4a9f49cdd998e052ee42efa0147522102632178d046673c9729d828cfee388e121f497707f810c131e0d3fc0fe0bd66d62103a0951ec7d3a9da9de171617026442fcd30f34d66100fab539853b43f508787d452aeffffffff0240420f000000000017a9141ade6b95896dde8ec4dee9e59af8849d3797348e8728af7ac60000000017a9148ce5408cfeaddb7ccb2545ded41ef47810945484870000000001000000011d9dc3a5df9b5b2eeb2bd11a2db243be9e8cc23e2f180bf317d32a499904c15501000000db00483045022100ebbd1c9a8ce626edbb1a7881df81e872ef8c6424feda36faa8a5745157400c6a02206eb463bc8acd5ea06a289e86115e1daae0c2cf10d9cbbd199e1311170d5543ef01483045022100809411a917dc8cf4f3a777f0388fdea6de06243ef7691e500c60abd1c7f19ae602205255d2b1191d8adedb77b814ccb66471eb8486cb4ff8727824254ee5589f176b0147522102632178d046673c9729d828cfee388e121f497707f810c131e0d3fc0fe0bd66d62103a0951ec7d3a9da9de171617026442fcd30f34d66100fab539853b43f508787d452aeffffffff0240420f000000000017a914759a49c772347be81c49517f9e1e6def6a88d4dd87800b85c60000000017a9148ce5408cfeaddb7ccb2545ded41ef47810945484870000000001000000018c51902affd8e5247dfcc2e5d0528a3815f53c8b6d2c200ff290b2b2b486d7704f0000006a47304402201be0d485f6a3ce871be80064c593c5327b3fd7e450f05ab7fae38385bc40cfbe02206e2a6c9970b5d1d10207892376733757486634fce4f352e772149c486857612101210350c33bc9a790c9495195761577b34912a949b73d5bc5ae5343f5ba08b33220ccffffffff0110270000000000001976a9142ab1c62710a7bdfdb4bb6394bbedc58b32b4d5a388ac0000000001000000018c51902affd8e5247dfcc2e5d0528a3815f53c8b6d2c200ff290b2b2b486d7704e0000006b483045022100ccc8c0ac90bdb0402842aec91830c765cdead7a728552a6a34de7d13a6dab28e02206c96f8640cf3444054e9632b197be30598a09c3d5defcd95750bdb922a60d64801210350c33bc9a790c9495195761577b34912a949b73d5bc5ae5343f5ba08b33220ccffffffff0110270000000000001976a9142ab1c62710a7bdfdb4bb6394bbedc58b32b4d5a388ac0000000001000000011b436669c06cbf3442e21a2fe3edc20cd3cf13c358c53234bc4d88bfd8c4bd2a000000006a47304402204a63410ee13db52c7609ab08e25b7fe3c608cc21cc1755ad13460685eb55193202204cd1ea80c06a81571119be0b8cccd96ef7cdd90f62c1fe2d538622feb08e22ba0121024baa8b67cc9ed8a97d90895e3716b25469b67cb26d3324d7aff213f507764765ffffffff010000000000000000306a2e516d64523365345261445653324d436a736e536171734a5753324465655446624238354541794a4d5843784c7934000000000100000001be4a95ed36316cada5118b1982e4cb4a07f93e7a4153e227466f1cb0776de995000000006b483045022100a22d5251deea0470806bab817013d675a63cd52218d6e477ab0c9d601d018b7f022042121b46afcdcd0c66f189398212b66085e88c6973ae560f1810c13e55e2bee40121024baa8b67cc9ed8a97d90895e3716b25469b67cb26d3324d7aff213f507764765ffffffff010000000000000000306a2e516d57484d57504e5248515872504c7338554c586b4d483746745356413675366b5a6b4a4e3851796e4e583751340000000001000000016c061a65b49edec21acdbc22f97dc853aa872302aeef13fabf0bf6807de1b8bd010000006b483045022100dd80381f2d158b4dad7f98d2d97317c533fb36e737542473feb05fa74d0b73bb02207097d4331196069167e525b61d132532292fd75cc039a5839c04c2545d427e2b0121035e9a597df8b417bef66811882a2844604fc591c427f642628f0fef46be19a4c9feffffff0280a4bf07000000001976a914573b9106e16ee0b5c143dc40f0724f77dd0e282088ac9533b22c000000001976a9149c4da607efb1d759d33da71778bc6cafa56acb5988acd31b0e0001000000017dae20994b69b28534e5b22f3d7c50f9d7541348cbf6f43fcc654263ebaf8f68000000006b483045022100a85300eb94b24b044877d0b0d61e08e16dbc82ec7d69c723a8a45519f95c35b002203d78376e6bee31b455c097557af7fe4d6b620bc74269e9a75e2aad2b545abddb012103b0d08aba2a5ac6cf2788fda941c386040e35e49d3a57d2aefb16c0438fb98acbfeffffff022222305f000000001976a914cfda30dd836b596db6a9c230c45ae2179107f04888ac80a4bf07000000001976a91442dfcf5823aacb185844e663873c35fb98bfd21b88acd31b0e000100000002ad3e85e4af30678a330f8941ed7a9ca17cd0236368d238cac4e9ff09c466fed1020000006b483045022100d1196c48a0392e09592f1b96b4aec32ab0cecb6fd17b1d0c85ab3250a2fe45d9022059217c82f684fcdecdbe660a2077ea956dfbbb964d2648bc1e8ae0f0fe565449012103b64e32e5f62e03701428fb1e3151e9a57f149c67708f6164a235c8199fe17cc2ffffffff34f0a71c1c2cd610522e9c18c67931cded5e9647d4419c49b99715e2a0795f3d020000006a4730440220316e81d8242abf3c5f885d200feca12c3adb63cf2cd4dc74602f7b8b0cba50340220210d525758df77ccdca6908311c1895275e07bbb29b45963a19252acde55873f012103b64e32e5f62e03701428fb1e3151e9a57f149c67708f6164a235c8199fe17cc2ffffffff0510270000000000001976a914449d2394dde057bc199f23fb8aa2e400f344611788ac10270000000000001976a914449d2394dde057bc199f23fb8aa2e400f344611788aca0860100000000001976a91413d35ad337dd80a055757e5ea0a45b59fee3060c88ac70110100000000001976a91413d35ad337dd80a055757e5ea0a45b59fee3060c88ac0000000000000000026a000000000001000000018e33fecc2ddbd86c5ea919f7bd5a5acf8a09f3e0cdaaaf4f08c5ef095161ef1100000000fdfe0000483045022100d2489b225d39b7d8b6767a6928c8029a2a1297c08fdf00d683ba0c1987e7d7000220176cb66c8a243806bb7421f658325a69a51c82c0c3314e37f2400f33626390210148304502210096cfa57662a545830d0e29610becd41ea031e256339913718ce18dbb1a27bdb00220482911c851d15adcd37097dff99a9ff1f97d953bcebc528835118f447412553e014c695221028d9889862b29430278c084b5c4090b7b807b31e047bcd212ebc2c4e43fc0e3c52103160949a7c8c81f2c25d7763f57eb1cb407d867c5b7c290331bd2dc4b1182c6d32103fbef3b60914bda9173765902013a251ec89450c75d0b5a96a143db1dabf98d9553aeffffffff0220e8891c0100000017a914d996715e081c50f8f6b1b4e7fb6ca214f9924fdf87809698000000000017a9145611d812263f32960228cb5f85329bce4770a218870000000001000000017720507dcbe6c69f652b0c0ce19406f482372d1a8abc05d45fb7acf97fb80eec00000000fdfe00004830450221009821d8e117de44b1202c829c0f5063997acf007cf9b561c6fb8d1212cddb6c40022010ff5067b0d9d4eca2da0ceb876e9a16f1a2142da866d3042a7bae8968813e8001483045022100dea759d14a8a1c5da5f3dcc5509871aaa2c1e3be03752c1b858d80fa4227163702205183d70cc28dcb6df9b037714c8b6442ef84e0ddce07711a30c731e9f0925090014c695221028d70ea66fe7a7def282df7b2b498007e5072933e42c18f63ce85975dcbcf1a8821037e8f842b1e47e21d88002c5aab2559212a4c2c9dbe5ef5347f2a29afd0510ec1210251259cb9fd4f6206488408286e4475c9c9fe887e57a3e32ae4da222778a2aedf53aeffffffff023380cb020000000017a9143b5a7e85b22656a34d43187ac8dd09acd7109d2487809698000000000017a914b9b4b555f594a34deec3ad61d5c5f3738b17ee158700000000").unwrap();
+    fn elements_dynafed_block() {
+        let block: Block = hex_deserialize!("\
+            000000a07a7159e1b793a80d826f72ddcfb11397160773ebc6e5ea10f3adb6ef\
+            ef481eb2cb94ec7aafb983b5ef45a33d49b725088abc43a127c035ef636a8852\
+            ecf9526d7bf2305d01000000012200204ae81572f06e1b88fd5ced7a1a000945\
+            432e83e1551e6f721ee9c00b8cc332604b000000000101510102000000010100\
+            00000000000000000000000000000000000000000000000000000000000000ff\
+            ffffff03510101ffffffff0201ed455f3f6bd15c60a3e770a04cbfcc482cb1bf\
+            95a0ac1db9bede08cac049783901000000000000000000016a01ed455f3f6bd1\
+            5c60a3e770a04cbfcc482cb1bf95a0ac1db9bede08cac0497839010000000000\
+            00000000266a24aa21a9ed94f15ed3a62165e4a0b99699cc28b48e19cb5bc1b1\
+            f47155db62d63f1e047d45000000000000012000000000000000000000000000\
+            000000000000000000000000000000000000000000000000\
+        ");
 
-        let decode: Result<Block, _> = deserialize(&segwit_block);
+        // Test that this is a block with compact current params and null proposed params
+        if let ExtData::Dynafed { current, proposed, .. } = block.clone().header.ext {
+            if let dynafed::Params::Compact { signblock_witness_limit, .. } = current {
+                assert_eq!(signblock_witness_limit, 75);
+            } else {
+                panic!("Current block dynafed params not compact");
+            }
+            if let dynafed::Params::Null { .. } = proposed {
+                /* pass */
+            } else {
+                panic!("Proposed block dynafed params not compact");
+            }
+        } else {
+            panic!("No dynafed params");
+        }
 
-        let prevhash = hex_decode("2aa2f2ca794ccbd40c16e2f3333f6b8b683f9e7179b2c4d74906000000000000").unwrap();
-        let merkle = hex_decode("10bc26e70a2f672ad420a6153dd0c28b40a6002c55531bfc99bf8994a8e8f67e").unwrap();
+        assert_eq!(
+            block.elements_hash().to_string(),
+            "4c7b60fc11a380811cfb8a17201ba54506a896eb1f53e9646d8bc2398d2448bd"
+        );
+        assert_eq!(block.header.version, 0x20000000);
 
-        assert!(decode.is_ok());
-        let real_decode = decode.unwrap();
-        assert_eq!(real_decode.header.version, 0x20000000);  // VERSIONBITS but no bits set
-        assert_eq!(serialize(&real_decode.header.prev_blockhash), prevhash);
-        assert_eq!(serialize(&real_decode.header.merkle_root), merkle);
-        assert_eq!(real_decode.header.merkle_root, real_decode.merkle_root());
-        assert_eq!(real_decode.header.time, 1472004949);
-        assert_eq!(real_decode.header.bits, 0x1a06d450);
-        assert_eq!(real_decode.header.nonce, 1879759182);
-        // [test] TODO: check the transaction data
+        // Full current and proposal
+        let block: Block = hex_deserialize!("\
+            000000a08b73cb590b11730880dd9c042101e853bcd2d5195f8efcffa66df48e\
+            bf39d8c10a9de8013a78fb0acc86dd7e1c137581e4951b196d7c9d8f96a90bd3\
+            c4768c575f535c5dcc010000022200204ae81572f06e1b88fd5ced7a1a000945\
+            432e83e1551e6f721ee9c00b8cc332604b00000017a91472c44f957fc011d97e\
+            3406667dca5b1c930c4026870151014202fcba7ecf41bc7e1be4ee122d9d22e3\
+            333671eb0a3a87b5cdf099d59874e1940f02fcba7ecf41bc7e1be4ee122d9d22\
+            e3333671eb0a3a87b5cdf099d59874e1940f021600142bb5aebe7c280263fa60\
+            6c97e4f6c07ee62dddf0640000002200208c2574892063f995fdf756bce07f46\
+            c1a5193e54cd52837ed91e32008ccf41ac0152014203808355deeb0555203b53\
+            df7ef8f36edaf66ab0207ca1b11968a7ac421554e62102fcba7ecf41bc7e1be4\
+            ee122d9d22e3333671eb0a3a87b5cdf099d59874e1940f010151010200000001\
+            0100000000000000000000000000000000000000000000000000000000000000\
+            00ffffffff0502cc010101ffffffff0201230f4f5d4b7c6fa845806ee4f67713\
+            459e1b69e8e60fcee2e4940c7a0d5de1b201000000002540be4000015101230f\
+            4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b20100\
+            0000000000000000266a24aa21a9ed94f15ed3a62165e4a0b99699cc28b48e19\
+            cb5bc1b1f47155db62d63f1e047d450000000000000120000000000000000000\
+            00000000000000000000000000000000000000000000000000000000\
+        ");
 
-        assert!(real_decode.check_witness_commitment());
-
-        assert_eq!(serialize(&real_decode), segwit_block);
-    }
-
-    #[test]
-    fn compact_roundrtip_test() {
-        let some_header = hex_decode("010000004ddccd549d28f385ab457e98d1b11ce80bfea2c5ab93015ade4973e400000000bf4473e53794beae34e64fccc471dace6ae544180816f89591894e0f417a914cd74d6e49ffff001d323b3a7b").unwrap();
-
-        let header: BlockHeader = deserialize(&some_header).expect("Can't deserialize correct block header");
-
-        assert_eq!(header.bits, BlockHeader::compact_target_from_u256(&header.target()));
+        // Test that this is a block with full current params and full proposed params
+        if let ExtData::Dynafed { current, proposed, .. } = block.clone().header.ext {
+            if let dynafed::Params::Full { .. } = current {
+                /* pass */
+            } else {
+                panic!("Current block dynafed params not full");
+            }
+            if let dynafed::Params::Full { .. } = proposed {
+                /* pass */
+            } else {
+                panic!("Proposed block dynafed params not full");
+            }
+        } else {
+            panic!("No dynafed params");
+        }
+        assert_eq!(
+            block.elements_hash().to_string(),
+            "6d6d1172376a187579396df29cd6bbf36761d504fb400eea2f314b3d6b6b44f5"
+        );
     }
 }
 

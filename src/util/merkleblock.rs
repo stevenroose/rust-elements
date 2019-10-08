@@ -439,7 +439,7 @@ impl MerkleBlock {
     /// # }
     /// ```
     pub fn from_block(block: &Block, match_txids: &HashSet<sha256d::Hash>) -> Self {
-        let header = block.header;
+        let header = block.header.clone();
 
         let mut matches: Vec<bool> = Vec::with_capacity(block.txdata.len());
         let mut hashes: Vec<sha256d::Hash> = Vec::with_capacity(block.txdata.len());

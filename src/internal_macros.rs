@@ -797,3 +797,44 @@ macro_rules! user_enum {
         }
     );
 }
+
+#[cfg(test)]
+macro_rules! hex_deserialize(
+    ($e:expr) => ({
+        use $crate::consensus::encode::deserialize;
+
+        fn hex_char(c: char) -> u8 {
+            match c {
+                '0' => 0,
+                '1' => 1,
+                '2' => 2,
+                '3' => 3,
+                '4' => 4,
+                '5' => 5,
+                '6' => 6,
+                '7' => 7,
+                '8' => 8,
+                '9' => 9,
+                'a' | 'A' => 10,
+                'b' | 'B' => 11,
+                'c' | 'C' => 12,
+                'd' | 'D' => 13,
+                'e' | 'E' => 14,
+                'f' | 'F' => 15,
+                x => panic!("Invalid character {} in hex string", x),
+            }
+        }
+
+        let mut ret = Vec::with_capacity($e.len() / 2);
+        let mut byte = 0;
+        for (ch, store) in $e.chars().zip([false, true].iter().cycle()) {
+            byte = (byte << 4) + hex_char(ch);
+            if *store {
+                ret.push(byte);
+                byte = 0;
+            }
+        }
+        deserialize(&ret).expect("deserialize object")
+    });
+);
+
