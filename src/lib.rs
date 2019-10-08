@@ -94,3 +94,5 @@ pub use util::key::PrivateKey;
 pub use util::key::PublicKey;
 pub use util::merkleblock::MerkleBlock;
 
+// elements:
+pub use util::issuance::AssetId;
