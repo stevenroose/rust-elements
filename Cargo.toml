@@ -1,17 +1,17 @@
 [package]
-name = "bitcoin"
-version = "0.21.0"
-authors = ["Andrew Poelstra <apoelstra@wpsoftware.net>"]
+name = "elements"
+version = "0.10.0"
+authors = ["The Elements Core team"]
+description = "Library with support for de/serialization, parsing and executing on data structures and network messages related to Elements"
 license = "CC0-1.0"
-homepage = "https://github.com/rust-bitcoin/rust-bitcoin/"
-repository = "https://github.com/rust-bitcoin/rust-bitcoin/"
-documentation = "https://docs.rs/bitcoin/"
-description = "General purpose library for using and interoperating with Bitcoin and other cryptocurrencies."
-keywords = [ "crypto", "bitcoin" ]
+homepage = "https://github.com/ElementsProject/rust-elements/"
+repository = "https://github.com/ElementsProject/rust-elements/"
+documentation = "https://docs.rs/elements/"
+keywords = [ "crypto", "bitcoin", "elements", "liquid", "sidechains" ]
 readme = "README.md"
 
 [lib]
-name = "bitcoin"
+name = "elements"
 path = "src/lib.rs"
 
 [features]
