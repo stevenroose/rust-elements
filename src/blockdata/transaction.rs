@@ -44,7 +44,7 @@ pub struct OutPoint {
     /// The index of the referenced output in its transaction's vout
     pub vout: u32,
 }
-serde_struct_human_string_impl!(OutPoint, "an OutPoint", txid, vout);
+serde_struct_human_string_impl!(OutPoint, "an Elements OutPoint", txid, vout);
 
 impl OutPoint {
     /// Create a new [OutPoint].
@@ -96,7 +96,15 @@ impl Default for OutPoint {
 
 impl fmt::Display for OutPoint {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}:{}", self.txid, self.vout)
+        write!(f, "[elements]{}:{}", self.txid, self.vout)
+    }
+}
+
+impl ElementsHash for OutPoint {
+    fn elements_hash(&self) -> sha256d::Hash {
+        let mut enc = sha256d::Hash::engine();
+        self.consensus_encode(&mut enc).unwrap();
+        sha256d::Hash::from_engine(enc)
     }
 }
 
@@ -162,7 +170,10 @@ fn parse_vout(s: &str) -> Result<u32, ParseOutPointError> {
 impl ::std::str::FromStr for OutPoint {
     type Err = ParseOutPointError;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(mut s: &str) -> Result<Self, Self::Err> {
+        if s.starts_with("[elements]") {
+            s = &s[10..];
+        }
         if s.len() > 75 { // 64 + 1 + 10
             return Err(ParseOutPointError::TooLong);
         }
