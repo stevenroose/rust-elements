@@ -24,7 +24,7 @@ use hashes::{sha256d, Hash};
 
 use util;
 use util::Error::{BlockBadTarget, BlockBadProofOfWork};
-use util::hash::{BitcoinHash, MerkleRoot, bitcoin_merkle_root};
+use util::hash::{ElementsHash, MerkleRoot, bitcoin_merkle_root};
 use util::uint::Uint256;
 use consensus::encode::Encodable;
 use network::constants::Network;
@@ -105,7 +105,7 @@ impl Block {
     /// Merkle root of transactions hashed for witness
     pub fn witness_root(&self) -> sha256d::Hash {
         let mut txhashes = vec!(sha256d::Hash::default());
-        txhashes.extend(self.txdata.iter().skip(1).map(|t|t.bitcoin_hash()));
+        txhashes.extend(self.txdata.iter().skip(1).map(|t|t.elements_hash()));
         bitcoin_merkle_root(txhashes)
     }
 }
@@ -171,7 +171,7 @@ impl BlockHeader {
         if target != required_target {
             return Err(BlockBadTarget);
         }
-        let data: [u8; 32] = self.bitcoin_hash().into_inner();
+        let data: [u8; 32] = self.elements_hash().into_inner();
         let mut ret = [0u64; 4];
         LittleEndian::read_u64_into(&data, &mut ret);
         let hash = &Uint256(ret);
@@ -190,16 +190,16 @@ impl BlockHeader {
     }
 }
 
-impl BitcoinHash for BlockHeader {
-    fn bitcoin_hash(&self) -> sha256d::Hash {
+impl ElementsHash for BlockHeader {
+    fn elements_hash(&self) -> sha256d::Hash {
         use consensus::encode::serialize;
         sha256d::Hash::hash(&serialize(self))
     }
 }
 
-impl BitcoinHash for Block {
-    fn bitcoin_hash(&self) -> sha256d::Hash {
-        self.header.bitcoin_hash()
+impl ElementsHash for Block {
+    fn elements_hash(&self) -> sha256d::Hash {
+        self.header.elements_hash()
     }
 }
 

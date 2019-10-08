@@ -52,7 +52,7 @@ pub fn bitcoin_merkle_root(data: Vec<sha256d::Hash>) -> sha256d::Hash {
 }
 
 /// Objects which are referred to by hash
-pub trait BitcoinHash {
+pub trait ElementsHash {
     /// Produces a Sha256dHash which can be used to refer to the object
-    fn bitcoin_hash(&self) -> sha256d::Hash;
+    fn elements_hash(&self) -> sha256d::Hash;
 }

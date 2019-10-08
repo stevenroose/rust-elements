@@ -30,7 +30,7 @@ use std::{fmt, io};
 use hashes::{self, sha256d, Hash};
 use hashes::hex::FromHex;
 
-use util::hash::BitcoinHash;
+use util::hash::ElementsHash;
 #[cfg(feature="bitcoinconsensus")] use blockdata::script;
 use blockdata::script::Script;
 use consensus::{encode, serialize, Decodable, Encodable};
@@ -275,12 +275,12 @@ impl Transaction {
             input: self.input.iter().map(|txin| TxIn { script_sig: Script::new(), witness: vec![], .. *txin }).collect(),
             output: self.output.clone(),
         };
-        cloned_tx.bitcoin_hash()
+        cloned_tx.elements_hash()
     }
 
     /// Computes the txid. For non-segwit transactions this will be identical
-    /// to the output of `BitcoinHash::bitcoin_hash()`, but for segwit transactions,
-    /// this will give the correct txid (not including witnesses) while `bitcoin_hash`
+    /// to the output of `ElementsHash::elements_hash()`, but for segwit transactions,
+    /// this will give the correct txid (not including witnesses) while `elements_hash`
     /// will also hash witnesses.
     pub fn txid(&self) -> sha256d::Hash {
         let mut enc = sha256d::Hash::engine();
@@ -426,8 +426,8 @@ impl Transaction {
     }
 }
 
-impl BitcoinHash for Transaction {
-    fn bitcoin_hash(&self) -> sha256d::Hash {
+impl ElementsHash for Transaction {
+    fn elements_hash(&self) -> sha256d::Hash {
         let mut enc = sha256d::Hash::engine();
         self.consensus_encode(&mut enc).unwrap();
         sha256d::Hash::from_engine(enc)
@@ -614,7 +614,7 @@ mod tests {
     use blockdata::script::Script;
     use consensus::encode::serialize;
     use consensus::encode::deserialize;
-    use util::hash::BitcoinHash;
+    use util::hash::ElementsHash;
     use util::misc::hex_bytes;
 
     use hashes::{sha256d, Hash};
@@ -689,7 +689,7 @@ mod tests {
         assert_eq!(realtx.output.len(), 1);
         assert_eq!(realtx.lock_time, 0);
 
-        assert_eq!(format!("{:x}", realtx.bitcoin_hash()),
+        assert_eq!(format!("{:x}", realtx.elements_hash()),
                    "a6eab3c14ab5272a58a5ba91505ba1a4b6d7a3a9fcbd187b6cd99a7b6d548cb7".to_string());
         assert_eq!(realtx.get_weight(), 193*4);
     }
@@ -758,7 +758,7 @@ mod tests {
         ).unwrap();
         let tx: Transaction = deserialize(&hex_tx).unwrap();
 
-        assert_eq!(format!("{:x}", tx.bitcoin_hash()), "d6ac4a5e61657c4c604dcde855a1db74ec6b3e54f32695d72c5e11c7761ea1b4");
+        assert_eq!(format!("{:x}", tx.elements_hash()), "d6ac4a5e61657c4c604dcde855a1db74ec6b3e54f32695d72c5e11c7761ea1b4");
         assert_eq!(format!("{:x}", tx.txid()), "9652aa62b0e748caeec40c4cb7bc17c6792435cc3dfe447dd1ca24f912a1c6ec");
         assert_eq!(tx.get_weight(), 2718);
 
@@ -773,7 +773,7 @@ mod tests {
         ).unwrap();
         let tx: Transaction = deserialize(&hex_tx).unwrap();
 
-        assert_eq!(format!("{:x}", tx.bitcoin_hash()), "971ed48a62c143bbd9c87f4bafa2ef213cfa106c6e140f111931d0be307468dd");
+        assert_eq!(format!("{:x}", tx.elements_hash()), "971ed48a62c143bbd9c87f4bafa2ef213cfa106c6e140f111931d0be307468dd");
         assert_eq!(format!("{:x}", tx.txid()), "971ed48a62c143bbd9c87f4bafa2ef213cfa106c6e140f111931d0be307468dd");
     }
 

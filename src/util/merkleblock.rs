@@ -62,7 +62,7 @@ use hashes::{sha256d, Hash};
 
 use blockdata::constants::{MAX_BLOCK_WEIGHT, MIN_TRANSACTION_WEIGHT};
 use consensus::encode::{self, Decodable, Encodable};
-use util::hash::BitcoinHash;
+use util::hash::ElementsHash;
 use util::merkleblock::MerkleBlockError::*;
 use {Block, BlockHeader};
 
@@ -444,7 +444,7 @@ impl MerkleBlock {
         let mut matches: Vec<bool> = Vec::with_capacity(block.txdata.len());
         let mut hashes: Vec<sha256d::Hash> = Vec::with_capacity(block.txdata.len());
 
-        for hash in block.txdata.iter().map(BitcoinHash::bitcoin_hash) {
+        for hash in block.txdata.iter().map(ElementsHash::elements_hash) {
             matches.push(match_txids.contains(&hash));
             hashes.push(hash);
         }
@@ -500,7 +500,7 @@ mod tests {
     use secp256k1::rand::prelude::*;
 
     use consensus::encode::{deserialize, serialize};
-    use util::hash::{bitcoin_merkle_root, BitcoinHash};
+    use util::hash::{bitcoin_merkle_root, ElementsHash};
     use util::merkleblock::{MerkleBlock, PartialMerkleTree};
     use {hex, Block};
 
@@ -613,7 +613,7 @@ mod tests {
             af156d6fc30b55fad4112df2b95531e68114e9ad10011e72f7b7cfdb025700";
 
         let mb: MerkleBlock = deserialize(&hex::decode(mb_hex).unwrap()).unwrap();
-        assert_eq!(get_block_13b8a().bitcoin_hash(), mb.header.bitcoin_hash());
+        assert_eq!(get_block_13b8a().elements_hash(), mb.header.elements_hash());
         assert_eq!(
             mb.header.merkle_root,
             mb.txn.extract_matches(&mut vec![], &mut vec![]).unwrap()
@@ -642,7 +642,7 @@ mod tests {
 
         let merkle_block = MerkleBlock::from_block(&block, &txids);
 
-        assert_eq!(merkle_block.header.bitcoin_hash(), block.bitcoin_hash());
+        assert_eq!(merkle_block.header.elements_hash(), block.elements_hash());
 
         let mut matches: Vec<sha256d::Hash> = vec![];
         let mut index: Vec<u32> = vec![];
@@ -675,7 +675,7 @@ mod tests {
 
         let merkle_block = MerkleBlock::from_block(&block, &txids);
 
-        assert_eq!(merkle_block.header.bitcoin_hash(), block.bitcoin_hash());
+        assert_eq!(merkle_block.header.elements_hash(), block.elements_hash());
 
         let mut matches: Vec<sha256d::Hash> = vec![];
         let mut index: Vec<u32> = vec![];
