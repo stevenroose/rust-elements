@@ -13,43 +13,22 @@
 
 //! Addresses
 //!
-//! Support for ordinary base58 Bitcoin addresses and private keys
-//!
-//! # Example: creating a new address from a randomly-generated key pair
-//!
-//! ```rust
-//! extern crate secp256k1;
-//! extern crate bitcoin;
-//!
-//! use bitcoin::network::constants::Network;
-//! use bitcoin::util::address::Address;
-//! use bitcoin::util::key;
-//! use secp256k1::Secp256k1;
-//! use secp256k1::rand::thread_rng;
-//!
-//! fn main() {
-//!     // Generate random key pair
-//!     let s = Secp256k1::new();
-//!     let public_key = key::PublicKey {
-//!         compressed: true,
-//!         key: s.generate_keypair(&mut thread_rng()).1,
-//!     };
-//!
-//!     // Generate pay-to-pubkey-hash address
-//!     let address = Address::p2pkh(&public_key, Network::Bitcoin);
-//! }
-//! ```
+//! Support for
+//! - ordinary base58 Elements addresses
+//! - bech32 segwit addresses
+//! - blech32 blinded segwit addresses
 
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
-use bech32;
+use bech32::{self, FromBase32, ToBase32};
 use hashes::{hash160, sha256, Hash};
+use secp256k1;
 
 use blockdata::opcodes;
 use blockdata::script;
-use network::constants::Network;
 use util::base58;
+use util::blech32;
 use util::key;
 
 /// Address error.
@@ -67,6 +46,12 @@ pub enum Error {
     InvalidWitnessProgramLength(usize),
     /// A v0 witness program must be either of length 20 or 32.
     InvalidSegwitV0ProgramLength(usize),
+    /// Blech32 encoding error
+    Blech32(bech32::Error),
+    /// An invalid blinding pubkey was encountered.
+    InvalidBlindingPubKey(secp256k1::Error),
+    /// Was unable to parse the address.
+    InvalidAddress(String),
 }
 
 impl fmt::Display for Error {
@@ -86,6 +71,11 @@ impl fmt::Display for Error {
                 "a v0 witness program must be either of length 20 or 32 bytes: length={}",
                 l
             ),
+            Error::Blech32(ref e) => write!(f, "blech32 error: {}", e),
+            Error::InvalidBlindingPubKey(ref e) => {
+                write!(f, "an invalid blinding pubkey was encountered: {}", e)
+            }
+            Error::InvalidAddress(ref a) => write!(f, "invalid address: \"{}\"", a),
         }
     }
 }
@@ -95,6 +85,8 @@ impl ::std::error::Error for Error {
         match *self {
             Error::Base58(ref e) => Some(e),
             Error::Bech32(ref e) => Some(e),
+            Error::Blech32(ref e) => Some(e),
+            Error::InvalidBlindingPubKey(ref e) => Some(e),
             _ => None,
         }
     }
@@ -108,13 +100,6 @@ impl ::std::error::Error for Error {
 impl From<base58::Error> for Error {
     fn from(e: base58::Error) -> Error {
         Error::Base58(e)
-    }
-}
-
-#[doc(hidden)]
-impl From<bech32::Error> for Error {
-    fn from(e: bech32::Error) -> Error {
-        Error::Bech32(e)
     }
 }
 
@@ -153,6 +138,41 @@ impl FromStr for AddressType {
             _ => Err(()),
         }
     }
+}
+
+/// The parameters to derive addresses.
+#[derive(Copy, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AddressParams {
+    /// The base58 prefix for p2pkh addresses.
+    pub p2pkh_prefix: u8,
+    /// The base58 prefix for p2sh addresses.
+    pub p2sh_prefix: u8,
+    /// The base58 prefix for blinded addresses.
+    pub blinded_prefix: u8,
+    /// The bech32 HRP for unblinded segwit addresses.
+    pub bech_hrp: &'static str,
+    /// The bech32 HRP for blinded segwit addresses.
+    pub blech_hrp: &'static str,
+}
+
+impl AddressParams {
+    /// The Liquid network address parameters.
+    pub const LIQUID: AddressParams = AddressParams {
+        p2pkh_prefix: 57,
+        p2sh_prefix: 39,
+        blinded_prefix: 12,
+        bech_hrp: "ex",
+        blech_hrp: "lq",
+    };
+
+    /// The default Elements network address parameters.
+    pub const ELEMENTS: AddressParams = AddressParams {
+        p2pkh_prefix: 235,
+        p2sh_prefix: 75,
+        blinded_prefix: 4,
+        bech_hrp: "ert",
+        blech_hrp: "el",
+    };
 }
 
 /// The method used to produce an address
@@ -230,55 +250,81 @@ impl Payload {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// A Bitcoin address
 pub struct Address {
-    /// The type of the address
+    /// the network
+    pub params: &'static AddressParams,
+    /// the traditional non-confidential payload
     pub payload: Payload,
-    /// The network on which this address is usable
-    pub network: Network,
+    /// the blinding pubkey
+    pub blinding_pubkey: Option<secp256k1::PublicKey>,
 }
-serde_string_impl!(Address, "a Bitcoin address");
+serde_string_impl!(Address, "an Elements address");
 
 impl Address {
+    /// Inspect if the address is a blinded address.
+    pub fn is_blinded(&self) -> bool {
+        self.blinding_pubkey.is_some()
+    }
+
     /// Creates a pay to (compressed) public key hash address from a public key
     /// This is the preferred non-witness type address
     #[inline]
-    pub fn p2pkh(pk: &key::PublicKey, network: Network) -> Address {
+    pub fn p2pkh(
+        pk: &key::PublicKey,
+        blinder: Option<secp256k1::PublicKey>,
+        params: &'static AddressParams,
+    ) -> Address {
         let mut hash_engine = hash160::Hash::engine();
         pk.write_into(&mut hash_engine);
 
         Address {
-            network: network,
+            params: params,
             payload: Payload::PubkeyHash(hash160::Hash::from_engine(hash_engine)),
+            blinding_pubkey: blinder,
         }
     }
 
     /// Creates a pay to script hash P2SH address from a script
     /// This address type was introduced with BIP16 and is the popular type to implement multi-sig these days.
     #[inline]
-    pub fn p2sh(script: &script::Script, network: Network) -> Address {
+    pub fn p2sh(
+        script: &script::Script,
+        blinder: Option<secp256k1::PublicKey>,
+        params: &'static AddressParams,
+    ) -> Address {
         Address {
-            network: network,
+            params: params,
             payload: Payload::ScriptHash(hash160::Hash::hash(&script[..])),
+            blinding_pubkey: blinder,
         }
     }
 
     /// Create a witness pay to public key address from a public key
     /// This is the native segwit address type for an output redeemable with a single signature
-    pub fn p2wpkh(pk: &key::PublicKey, network: Network) -> Address {
+    pub fn p2wpkh(
+        pk: &key::PublicKey,
+        blinder: Option<secp256k1::PublicKey>,
+        params: &'static AddressParams,
+    ) -> Address {
         let mut hash_engine = hash160::Hash::engine();
         pk.write_into(&mut hash_engine);
 
         Address {
-            network: network,
+            params: params,
             payload: Payload::WitnessProgram {
                 version: bech32::u5::try_from_u8(0).expect("0<32"),
                 program: hash160::Hash::from_engine(hash_engine)[..].to_vec(),
             },
+            blinding_pubkey: blinder,
         }
     }
 
     /// Create a pay to script address that embeds a witness pay to public key
     /// This is a segwit address type that looks familiar (as p2sh) to legacy clients
-    pub fn p2shwpkh(pk: &key::PublicKey, network: Network) -> Address {
+    pub fn p2shwpkh(
+        pk: &key::PublicKey,
+        blinder: Option<secp256k1::PublicKey>,
+        params: &'static AddressParams,
+    ) -> Address {
         let mut hash_engine = hash160::Hash::engine();
         pk.write_into(&mut hash_engine);
 
@@ -287,33 +333,44 @@ impl Address {
             .push_slice(&hash160::Hash::from_engine(hash_engine)[..]);
 
         Address {
-            network: network,
+            params: params,
             payload: Payload::ScriptHash(hash160::Hash::hash(builder.into_script().as_bytes())),
+            blinding_pubkey: blinder,
         }
     }
 
     /// Create a witness pay to script hash address
-    pub fn p2wsh(script: &script::Script, network: Network) -> Address {
+    pub fn p2wsh(
+        script: &script::Script,
+        blinder: Option<secp256k1::PublicKey>,
+        params: &'static AddressParams,
+    ) -> Address {
         Address {
-            network: network,
+            params: params,
             payload: Payload::WitnessProgram {
                 version: bech32::u5::try_from_u8(0).expect("0<32"),
                 program: sha256::Hash::hash(&script[..])[..].to_vec(),
             },
+            blinding_pubkey: blinder,
         }
     }
 
     /// Create a pay to script address that embeds a witness pay to script hash address
     /// This is a segwit address type that looks familiar (as p2sh) to legacy clients
-    pub fn p2shwsh(script: &script::Script, network: Network) -> Address {
+    pub fn p2shwsh(
+        script: &script::Script,
+        blinder: Option<secp256k1::PublicKey>,
+        params: &'static AddressParams,
+    ) -> Address {
         let ws = script::Builder::new()
             .push_int(0)
             .push_slice(&sha256::Hash::hash(&script[..])[..])
             .into_script();
 
         Address {
-            network: network,
+            params: params,
             payload: Payload::ScriptHash(hash160::Hash::hash(&ws[..])),
+            blinding_pubkey: blinder,
         }
     }
 
@@ -350,10 +407,15 @@ impl Address {
     }
 
     /// Get an [Address] from an output script (scriptPubkey).
-    pub fn from_script(script: &script::Script, network: Network) -> Option<Address> {
+    pub fn from_script(
+        script: &script::Script,
+        blinder: Option<secp256k1::PublicKey>,
+        params: &'static AddressParams,
+    ) -> Option<Address> {
         Some(Address {
+            params: params,
             payload: Payload::from_script(script)?,
-            network: network,
+            blinding_pubkey: blinder,
         })
     }
 
@@ -361,41 +423,194 @@ impl Address {
     pub fn script_pubkey(&self) -> script::Script {
         self.payload.script_pubkey()
     }
+
+    fn from_bech32(
+        s: &str,
+        blinded: bool,
+        params: &'static AddressParams,
+    ) -> Result<Address, Error> {
+        let payload = if !blinded {
+            bech32::decode(s).map_err(Error::Bech32)?.1
+        } else {
+            blech32::decode(s).map_err(Error::Blech32)?.1
+        };
+
+        if payload.len() == 0 {
+            return Err(Error::InvalidAddress(s.to_owned()));
+        }
+
+        // Get the script version and program (converted from 5-bit to 8-bit)
+        let (version, data) = {
+            let (v, p5) = payload.split_at(1);
+            let data_res = Vec::from_base32(p5);
+            if let Err(e) = data_res {
+                return Err(match blinded {
+                    true => Error::Blech32(e),
+                    false => Error::Bech32(e),
+                });
+            }
+            (v[0], data_res.unwrap())
+        };
+        if version.to_u8() > 16 {
+            return Err(Error::InvalidWitnessVersion(version.to_u8()));
+        }
+
+        // Segwit version specific checks.
+        if !blinded && version.to_u8() == 0 && data.len() != 20 && data.len() != 32 {
+            return Err(Error::InvalidWitnessProgramLength(data.len()));
+        }
+        if blinded && version.to_u8() == 0 && data.len() != 53 && data.len() != 65 {
+            return Err(Error::InvalidWitnessProgramLength(data.len()));
+        }
+
+        let (blinding_pubkey, program) = match blinded {
+            true => (
+                Some(
+                    secp256k1::PublicKey::from_slice(&data[..33])
+                        .map_err(Error::InvalidBlindingPubKey)?,
+                ),
+                data[33..].to_vec(),
+            ),
+            false => (None, data),
+        };
+
+        Ok(Address {
+            params: params,
+            payload: Payload::WitnessProgram {
+                version: version,
+                program: program,
+            },
+            blinding_pubkey: blinding_pubkey,
+        })
+    }
+
+    // data.len() should be >= 1 when this method is called
+    fn from_base58(data: &[u8], params: &'static AddressParams) -> Result<Address, Error> {
+        // When unblinded, the structure is:
+        // <1: regular prefix> <20: hash160>
+        // When blinded, the structure is:
+        // <1: blinding prefix> <1: regular prefix> <33: blinding pubkey> <20: hash160>
+
+        let (blinded, prefix) = match data[0] == params.blinded_prefix {
+            true => {
+                if data.len() != 55 {
+                    return Err(base58::Error::InvalidLength(data.len()))?;
+                }
+                (true, data[1])
+            }
+            false => {
+                if data.len() != 21 {
+                    return Err(base58::Error::InvalidLength(data.len()))?;
+                }
+                (false, data[0])
+            }
+        };
+
+        let (blinding_pubkey, payload_data) = match blinded {
+            true => (
+                Some(
+                    secp256k1::PublicKey::from_slice(&data[2..35])
+                        .map_err(Error::InvalidBlindingPubKey)?,
+                ),
+                &data[35..],
+            ),
+            false => (None, &data[1..]),
+        };
+
+        let payload = if prefix == params.p2pkh_prefix {
+            Payload::PubkeyHash(hash160::Hash::from_slice(payload_data).unwrap())
+        } else if prefix == params.p2sh_prefix {
+            Payload::ScriptHash(hash160::Hash::from_slice(payload_data).unwrap())
+        } else {
+            return Err(base58::Error::InvalidVersion(vec![prefix]))?;
+        };
+
+        Ok(Address {
+            params: params,
+            payload: payload,
+            blinding_pubkey: blinding_pubkey,
+        })
+    }
+
+    /// Parse the address using the given parameters.
+    /// When using the built-in parameters, you can use [FromStr].
+    pub fn parse_with_params(
+        s: &str,
+        params: &'static AddressParams,
+    ) -> Result<Address, Error> {
+        // Bech32.
+        let prefix = find_bech32_prefix(s);
+        let b32_ex = match_prefix(prefix, params.bech_hrp);
+        let b32_bl = match_prefix(prefix, params.blech_hrp);
+        if b32_ex || b32_bl {
+            return Address::from_bech32(s, b32_bl, params);
+        }
+
+        // Base58.
+        if s.len() > 150 {
+            return Err(base58::Error::InvalidLength(s.len() * 11 / 15))?;
+        }
+        let data = base58::from_check(s)?;
+        Address::from_base58(&data, params)
+    }
 }
 
 impl Display for Address {
     fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
         match self.payload {
             Payload::PubkeyHash(ref hash) => {
-                let mut prefixed = [0; 21];
-                prefixed[0] = match self.network {
-                    Network::Bitcoin => 0,
-                    Network::Testnet | Network::Regtest => 111,
-                };
-                prefixed[1..].copy_from_slice(&hash[..]);
-                base58::check_encode_slice_to_fmt(fmt, &prefixed[..])
+                if let Some(ref blinder) = self.blinding_pubkey {
+                    let mut prefixed = [0; 55]; // 1 + 1 + 33 + 20
+                    prefixed[0] = self.params.blinded_prefix;
+                    prefixed[1] = self.params.p2pkh_prefix;
+                    prefixed[2..35].copy_from_slice(&blinder.serialize());
+                    prefixed[35..].copy_from_slice(&hash[..]);
+                    base58::check_encode_slice_to_fmt(fmt, &prefixed[..])
+                } else {
+                    let mut prefixed = [0; 21];
+                    prefixed[0] = self.params.p2pkh_prefix;
+                    prefixed[1..].copy_from_slice(&hash[..]);
+                    base58::check_encode_slice_to_fmt(fmt, &prefixed[..])
+                }
             }
             Payload::ScriptHash(ref hash) => {
-                let mut prefixed = [0; 21];
-                prefixed[0] = match self.network {
-                    Network::Bitcoin => 5,
-                    Network::Testnet | Network::Regtest => 196,
-                };
-                prefixed[1..].copy_from_slice(&hash[..]);
-                base58::check_encode_slice_to_fmt(fmt, &prefixed[..])
+                if let Some(ref blinder) = self.blinding_pubkey {
+                    let mut prefixed = [0; 55]; // 1 + 1 + 33 + 20
+                    prefixed[0] = self.params.blinded_prefix;
+                    prefixed[1] = self.params.p2sh_prefix;
+                    prefixed[2..35].copy_from_slice(&blinder.serialize());
+                    prefixed[35..].copy_from_slice(&hash[..]);
+                    base58::check_encode_slice_to_fmt(fmt, &prefixed[..])
+                } else {
+                    let mut prefixed = [0; 21];
+                    prefixed[0] = self.params.p2sh_prefix;
+                    prefixed[1..].copy_from_slice(&hash[..]);
+                    base58::check_encode_slice_to_fmt(fmt, &prefixed[..])
+                }
             }
             Payload::WitnessProgram {
-                version: ver,
-                program: ref prog,
+                version: witver,
+                program: ref witprog,
             } => {
-                let hrp = match self.network {
-                    Network::Bitcoin => "bc",
-                    Network::Testnet => "tb",
-                    Network::Regtest => "bcrt",
+                let hrp = match self.blinding_pubkey.is_some() {
+                    true => self.params.blech_hrp,
+                    false => self.params.bech_hrp,
                 };
-                let mut bech32_writer = bech32::Bech32Writer::new(hrp, fmt)?;
-                bech32::WriteBase32::write_u5(&mut bech32_writer, ver)?;
-                bech32::ToBase32::write_base32(&prog, &mut bech32_writer)
+
+                if self.is_blinded() {
+                    let mut data = Vec::with_capacity(53);
+                    if let Some(ref blinder) = self.blinding_pubkey {
+                        data.extend_from_slice(&blinder.serialize());
+                    }
+                    data.extend_from_slice(&witprog);
+                    let mut b32_data = vec![witver];
+                    b32_data.extend_from_slice(&data.to_base32());
+                    blech32::encode_to_fmt(fmt, &hrp, &b32_data)
+                } else {
+                    let mut bech32_writer = bech32::Bech32Writer::new(hrp, fmt)?;
+                    bech32::WriteBase32::write_u5(&mut bech32_writer, witver)?;
+                    bech32::ToBase32::write_base32(&witprog, &mut bech32_writer)
+                }
             }
         }
     }
@@ -411,86 +626,79 @@ fn find_bech32_prefix(bech32: &str) -> &str {
     }
 }
 
+/// Convert an ascii char to its lowercase counterpart.
+/// Taken from the Rust v1.23.0 code.
+fn to_ascii_lowercase(c: char) -> char {
+    let is_ascii_uppercase = match c as u8 {
+        b'A'...b'Z' => true,
+        _ => false
+    };
+    let c_u8 = (c as u8) | ((is_ascii_uppercase as u8) << 5);
+    c_u8 as char
+}
+
+/// Check if a character is ascii.
+/// Taken from the Rust v1.23.0 code.
+fn is_ascii(c: char) -> bool {
+    (c as u32) <= 0x7F
+}
+
+/// Checks if both prefixes match, regardless of case.
+/// The first prefix can be mixed case, but the second one is expected in
+/// lower case.
+fn match_prefix(prefix_mixed: &str, prefix_lower: &str) -> bool {
+    if prefix_lower.len() != prefix_mixed.len() {
+        false
+    } else {
+        prefix_lower
+            .chars()
+            .zip(prefix_mixed.chars())
+            .all(|(char_lower, char_mixed)| is_ascii(char_mixed) && char_lower == to_ascii_lowercase(char_mixed))
+    }
+}
+
 impl FromStr for Address {
+
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Address, Error> {
-        // try bech32
-        let bech32_network = match find_bech32_prefix(s) {
-            // note that upper or lowercase is allowed but NOT mixed case
-            "bc" | "BC" => Some(Network::Bitcoin),
-            "tb" | "TB" => Some(Network::Testnet),
-            "bcrt" | "BCRT" => Some(Network::Regtest),
-            _ => None,
-        };
-        if let Some(network) = bech32_network {
-            // decode as bech32
-            let (_, payload) = bech32::decode(s)?;
-            if payload.len() == 0 {
-                return Err(Error::EmptyBech32Payload);
-            }
+        // shorthands
+        let liq = &AddressParams::LIQUID;
+        let ele = &AddressParams::ELEMENTS;
 
-            // Get the script version and program (converted from 5-bit to 8-bit)
-            let (version, program): (bech32::u5, Vec<u8>) = {
-                let (v, p5) = payload.split_at(1);
-                (v[0], bech32::FromBase32::from_base32(p5)?)
-            };
-
-            // Generic segwit checks.
-            if version.to_u8() > 16 {
-                return Err(Error::InvalidWitnessVersion(version.to_u8()));
-            }
-            if program.len() < 2 || program.len() > 40 {
-                return Err(Error::InvalidWitnessProgramLength(program.len()));
-            }
-
-            // Specific segwit v0 check.
-            if version.to_u8() == 0 && (program.len() != 20 && program.len() != 32) {
-                return Err(Error::InvalidSegwitV0ProgramLength(program.len()));
-            }
-
-            return Ok(Address {
-                payload: Payload::WitnessProgram {
-                    version: version,
-                    program: program,
-                },
-                network: network,
-            });
+        // Bech32.
+        let prefix = find_bech32_prefix(s);
+        if match_prefix(prefix, liq.bech_hrp) {
+            return Address::from_bech32(s, false, liq);
+        }
+        if match_prefix(prefix, liq.blech_hrp) {
+            return Address::from_bech32(s, true, liq);
+        }
+        if match_prefix(prefix, ele.bech_hrp) {
+            return Address::from_bech32(s, false, ele);
+        }
+        if match_prefix(prefix, ele.blech_hrp) {
+            return Address::from_bech32(s, true, ele);
         }
 
-        // Base58
-        if s.len() > 50 {
-            return Err(Error::Base58(base58::Error::InvalidLength(s.len() * 11 / 15)));
+        // Base58.
+        if s.len() > 150 {
+            return Err(base58::Error::InvalidLength(s.len() * 11 / 15))?;
         }
         let data = base58::from_check(s)?;
-        if data.len() != 21 {
-            return Err(Error::Base58(base58::Error::InvalidLength(data.len())));
+        if data.len() < 1 {
+            return Err(base58::Error::InvalidLength(data.len()))?;
         }
 
-        let (network, payload) = match data[0] {
-            0 => (
-                Network::Bitcoin,
-                Payload::PubkeyHash(hash160::Hash::from_slice(&data[1..]).unwrap()),
-            ),
-            5 => (
-                Network::Bitcoin,
-                Payload::ScriptHash(hash160::Hash::from_slice(&data[1..]).unwrap()),
-            ),
-            111 => (
-                Network::Testnet,
-                Payload::PubkeyHash(hash160::Hash::from_slice(&data[1..]).unwrap()),
-            ),
-            196 => (
-                Network::Testnet,
-                Payload::ScriptHash(hash160::Hash::from_slice(&data[1..]).unwrap()),
-            ),
-            x => return Err(Error::Base58(base58::Error::InvalidVersion(vec![x]))),
-        };
+        let p = data[0];
+        if p == liq.p2pkh_prefix || p == liq.p2sh_prefix || p == liq.blinded_prefix {
+            return Address::from_base58(&data, liq);
+        }
+        if p == ele.p2pkh_prefix || p == ele.p2sh_prefix || p == ele.blinded_prefix {
+            return Address::from_base58(&data, ele);
+        }
 
-        Ok(Address {
-            network: network,
-            payload: payload,
-        })
+        Err(Error::InvalidAddress(s.to_owned()))
     }
 }
 
@@ -502,246 +710,105 @@ impl ::std::fmt::Debug for Address {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-    use std::string::ToString;
-
-    use hashes::{hash160, Hash};
-    use hex::{decode as hex_decode, encode as hex_encode};
-
-    use blockdata::script::Script;
-    use network::constants::Network::{Bitcoin, Testnet};
-    use util::key::PublicKey;
-
     use super::*;
 
-    macro_rules! hex (($hex:expr) => (hex_decode($hex).unwrap()));
-    macro_rules! hex_key (($hex:expr) => (PublicKey::from_slice(&hex!($hex)).unwrap()));
-    macro_rules! hex_script (($hex:expr) => (Script::from(hex!($hex))));
-    macro_rules! hex_hash160 (($hex:expr) => (hash160::Hash::from_slice(&hex!($hex)).unwrap()));
+    use secp256k1::{PublicKey, Secp256k1};
+    #[cfg(feature = "serde")]
+    use serde_json;
+
+    use util::key;
+    use blockdata::script::Script;
 
     fn roundtrips(addr: &Address) {
         assert_eq!(
-            Address::from_str(&addr.to_string()).unwrap(),
-            *addr,
+            Address::from_str(&addr.to_string()).ok().as_ref(),
+            Some(addr),
             "string round-trip failed for {}",
             addr,
         );
         assert_eq!(
-            Address::from_script(&addr.script_pubkey(), addr.network).as_ref(),
+            Address::from_script(&addr.script_pubkey(), addr.blinding_pubkey, addr.params).as_ref(),
             Some(addr),
             "script round-trip failed for {}",
             addr,
         );
-        //TODO: add serde roundtrip after no-strason PR
-    }
-
-    #[test]
-    fn test_p2pkh_address_58() {
-        let addr = Address {
-            network: Bitcoin,
-            payload: Payload::PubkeyHash(hex_hash160!("162c5ea71c0b23f5b9022ef047c4a86470a5b070")),
-        };
-
+        #[cfg(feature = "serde")]
         assert_eq!(
-            addr.script_pubkey(),
-            hex_script!("76a914162c5ea71c0b23f5b9022ef047c4a86470a5b07088ac")
+            serde_json::from_value::<Address>(serde_json::to_value(&addr).unwrap()).ok().as_ref(),
+            Some(addr)
         );
-        assert_eq!(&addr.to_string(), "132F25rTsvBdp9JzLLBHP5mvGY66i1xdiM");
-        assert_eq!(addr.address_type(), Some(AddressType::P2pkh));
-        roundtrips(&addr);
     }
 
     #[test]
-    fn test_p2pkh_from_key() {
-        let key = hex_key!("048d5141948c1702e8c95f438815794b87f706a8d4cd2bffad1dc1570971032c9b6042a0431ded2478b5c9cf2d81c124a5e57347a3c63ef0e7716cf54d613ba183");
-        let addr = Address::p2pkh(&key, Bitcoin);
-        assert_eq!(&addr.to_string(), "1QJVDzdqb1VpbDK7uDeyVXy9mR27CJiyhY");
+    fn exhaustive() {
+        let blinder_hex = "0218845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166";
+        let blinder = PublicKey::from_str(blinder_hex).unwrap();
+        let sk_wif = "cVt4o7BGAig1UXywgGSmARhxMdzP5qvQsxKkSsc1XEkw3tDTQFpy";
+        let sk = key::PrivateKey::from_wif(sk_wif).unwrap();
+        let pk = sk.public_key(&Secp256k1::new());
+        let script: Script = vec![1u8, 2, 42, 255, 196].into();
 
-        let key = hex_key!(&"03df154ebfcf29d29cc10d5c2565018bce2d9edbab267c31d2caf44a63056cf99f");
-        let addr = Address::p2pkh(&key, Testnet);
-        assert_eq!(&addr.to_string(), "mqkhEMH6NCeYjFybv7pvFC22MFeaNT9AQC");
-        assert_eq!(addr.address_type(), Some(AddressType::P2pkh));
-        roundtrips(&addr);
-    }
-
-    #[test]
-    fn test_p2sh_address_58() {
-        let addr = Address {
-            network: Bitcoin,
-            payload: Payload::ScriptHash(hex_hash160!("162c5ea71c0b23f5b9022ef047c4a86470a5b070")),
-        };
-
-        assert_eq!(
-            addr.script_pubkey(),
-            hex_script!("a914162c5ea71c0b23f5b9022ef047c4a86470a5b07087")
-        );
-        assert_eq!(&addr.to_string(), "33iFwdLuRpW1uK1RTRqsoi8rR4NpDzk66k");
-        assert_eq!(addr.address_type(), Some(AddressType::P2sh));
-        roundtrips(&addr);
-    }
-
-    #[test]
-    fn test_p2sh_parse() {
-        let script = hex_script!("552103a765fc35b3f210b95223846b36ef62a4e53e34e2925270c2c7906b92c9f718eb2103c327511374246759ec8d0b89fa6c6b23b33e11f92c5bc155409d86de0c79180121038cae7406af1f12f4786d820a1466eec7bc5785a1b5e4a387eca6d797753ef6db2103252bfb9dcaab0cd00353f2ac328954d791270203d66c2be8b430f115f451b8a12103e79412d42372c55dd336f2eb6eb639ef9d74a22041ba79382c74da2338fe58ad21035049459a4ebc00e876a9eef02e72a3e70202d3d1f591fc0dd542f93f642021f82102016f682920d9723c61b27f562eb530c926c00106004798b6471e8c52c60ee02057ae");
-        let addr = Address::p2sh(&script, Testnet);
-
-        assert_eq!(&addr.to_string(), "2N3zXjbwdTcPsJiy8sUK9FhWJhqQCxA8Jjr");
-        assert_eq!(addr.address_type(), Some(AddressType::P2sh));
-        roundtrips(&addr);
-    }
-
-    #[test]
-    fn test_p2wpkh() {
-        // stolen from Bitcoin transaction: b3c8c2b6cfc335abbcb2c7823a8453f55d64b2b5125a9a61e8737230cdb8ce20
-        let key = hex_key!("033bc8c83c52df5712229a2f72206d90192366c36428cb0c12b6af98324d97bfbc");
-        let addr = Address::p2wpkh(&key, Bitcoin);
-        assert_eq!(&addr.to_string(), "bc1qvzvkjn4q3nszqxrv3nraga2r822xjty3ykvkuw");
-        assert_eq!(addr.address_type(), Some(AddressType::P2wpkh));
-        roundtrips(&addr);
-    }
-
-    #[test]
-    fn test_p2wsh() {
-        // stolen from Bitcoin transaction 5df912fda4becb1c29e928bec8d64d93e9ba8efa9b5b405bd683c86fd2c65667
-        let script = hex_script!("52210375e00eb72e29da82b89367947f29ef34afb75e8654f6ea368e0acdfd92976b7c2103a1b26313f430c4b15bb1fdce663207659d8cac749a0e53d70eff01874496feff2103c96d495bfdd5ba4145e3e046fee45e84a8a48ad05bd8dbb395c011a32cf9f88053ae");
-        let addr = Address::p2wsh(&script, Bitcoin);
-        assert_eq!(
-            &addr.to_string(),
-            "bc1qwqdg6squsna38e46795at95yu9atm8azzmyvckulcc7kytlcckxswvvzej"
-        );
-        assert_eq!(addr.address_type(), Some(AddressType::P2wsh));
-        roundtrips(&addr);
-    }
-
-    #[test]
-    fn test_p2shwpkh() {
-        // stolen from Bitcoin transaction: ad3fd9c6b52e752ba21425435ff3dd361d6ac271531fc1d2144843a9f550ad01
-        let key = hex_key!("026c468be64d22761c30cd2f12cbc7de255d592d7904b1bab07236897cc4c2e766");
-        let addr = Address::p2shwpkh(&key, Bitcoin);
-        assert_eq!(&addr.to_string(), "3QBRmWNqqBGme9er7fMkGqtZtp4gjMFxhE");
-        assert_eq!(addr.address_type(), Some(AddressType::P2sh));
-        roundtrips(&addr);
-    }
-
-    #[test]
-    fn test_p2shwsh() {
-        // stolen from Bitcoin transaction f9ee2be4df05041d0e0a35d7caa3157495ca4f93b233234c9967b6901dacf7a9
-        let script = hex_script!("522103e5529d8eaa3d559903adb2e881eb06c86ac2574ffa503c45f4e942e2a693b33e2102e5f10fcdcdbab211e0af6a481f5532536ec61a5fdbf7183770cf8680fe729d8152ae");
-        let addr = Address::p2shwsh(&script, Bitcoin);
-        assert_eq!(&addr.to_string(), "36EqgNnsWW94SreZgBWc1ANC6wpFZwirHr");
-        assert_eq!(addr.address_type(), Some(AddressType::P2sh));
-        roundtrips(&addr);
-    }
-
-    #[test]
-    fn test_non_existent_segwit_version() {
-        let version = 13;
-        // 40-byte program
-        let program = hex!(
-            "654f6ea368e0acdfd92976b7c2103a1b26313f430654f6ea368e0acdfd92976b7c2103a1b26313f4"
-        );
-        let addr = Address {
-            payload: Payload::WitnessProgram {
-                version: bech32::u5::try_from_u8(version).expect("0<32"),
-                program: program,
-            },
-            network: Network::Bitcoin,
-        };
-        roundtrips(&addr);
-    }
-
-    #[test]
-    fn test_bip173_vectors() {
-        let valid_vectors = [
-            ("BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4", "0014751e76e8199196d454941c45d1b3a323f1433bd6"),
-            ("tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7", "00201863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262"),
-            ("bc1pw508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7k7grplx", "5128751e76e8199196d454941c45d1b3a323f1433bd6751e76e8199196d454941c45d1b3a323f1433bd6"),
-            ("BC1SW50QA3JX3S", "6002751e"),
-            ("bc1zw508d6qejxtdg4y5r3zarvaryvg6kdaj", "5210751e76e8199196d454941c45d1b3a323"),
-            ("tb1qqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesrxh6hy", "0020000000c4a5cad46221b2a187905e5266362b99d5e91c6ce24d165dab93e86433"),
+        let vectors = [
+            /* #00 */ Address::p2pkh(&pk, None, &AddressParams::LIQUID),
+            /* #01 */ Address::p2pkh(&pk, None, &AddressParams::ELEMENTS),
+            /* #02 */ Address::p2pkh(&pk, Some(blinder.clone()), &AddressParams::LIQUID),
+            /* #03 */ Address::p2pkh(&pk, Some(blinder.clone()), &AddressParams::ELEMENTS),
+            /* #04 */ Address::p2sh(&script, None, &AddressParams::LIQUID),
+            /* #05 */ Address::p2sh(&script, None, &AddressParams::ELEMENTS),
+            /* #06 */ Address::p2sh(&script, Some(blinder.clone()), &AddressParams::LIQUID),
+            /* #07 */
+            Address::p2sh(&script, Some(blinder.clone()), &AddressParams::ELEMENTS),
+            /* #08 */ Address::p2wpkh(&pk, None, &AddressParams::LIQUID),
+            /* #09 */ Address::p2wpkh(&pk, None, &AddressParams::ELEMENTS),
+            /* #10 */ Address::p2wpkh(&pk, Some(blinder.clone()), &AddressParams::LIQUID),
+            /* #11 */ Address::p2wpkh(&pk, Some(blinder.clone()), &AddressParams::ELEMENTS),
+            /* #12 */ Address::p2shwpkh(&pk, None, &AddressParams::LIQUID),
+            /* #13 */ Address::p2shwpkh(&pk, None, &AddressParams::ELEMENTS),
+            /* #14 */ Address::p2shwpkh(&pk, Some(blinder.clone()), &AddressParams::LIQUID),
+            /* #15 */
+            Address::p2shwpkh(&pk, Some(blinder.clone()), &AddressParams::ELEMENTS),
+            /* #16 */ Address::p2wsh(&script, None, &AddressParams::LIQUID),
+            /* #17 */ Address::p2wsh(&script, None, &AddressParams::ELEMENTS),
+            /* #18 */ Address::p2wsh(&script, Some(blinder.clone()), &AddressParams::LIQUID),
+            /* #19 */
+            Address::p2wsh(&script, Some(blinder.clone()), &AddressParams::ELEMENTS),
+            /* #20 */ Address::p2shwsh(&script, None, &AddressParams::LIQUID),
+            /* #21 */ Address::p2shwsh(&script, None, &AddressParams::ELEMENTS),
+            /* #22 */
+            Address::p2shwsh(&script, Some(blinder.clone()), &AddressParams::LIQUID),
+            /* #23 */
+            Address::p2shwsh(&script, Some(blinder.clone()), &AddressParams::ELEMENTS),
         ];
-        for vector in &valid_vectors {
-            let addr: Address = vector.0.parse().unwrap();
-            assert_eq!(&hex_encode(addr.script_pubkey().as_bytes()), vector.1);
+
+        for addr in &vectors {
+            roundtrips(addr);
+        }
+    }
+
+    #[test]
+    fn test_actuals() {
+        // vectors: (address, blinded?, params)
+        let addresses = [
+            // Elements
+            ("2dxmEBXc2qMYcLSKiDBxdEePY3Ytixmnh4E", false, AddressParams::ELEMENTS),
+            ("CTEo6VKG8xbe7HnfVW9mQoWTgtgeRSPktwTLbELzGw5tV8Ngzu53EBiasFMQKVbWmKWWTAdN5AUf4M6Y", true, AddressParams::ELEMENTS),
+            ("ert1qwhh2n5qypypm0eufahm2pvj8raj9zq5c27cysu", false, AddressParams::ELEMENTS),
+            ("el1qq0umk3pez693jrrlxz9ndlkuwne93gdu9g83mhhzuyf46e3mdzfpva0w48gqgzgrklncnm0k5zeyw8my2ypfsmxh4xcjh2rse", true, AddressParams::ELEMENTS),
+            // Liquid
+            ("GqiQRsPEyJLAsEBFB5R34KHuqxDNkG3zur", false, AddressParams::LIQUID),
+            ("VJLDwMVWXg8RKq4mRe3YFNTAEykVN6V8x5MRUKKoC3nfRnbpnZeiG3jygMC6A4Gw967GY5EotJ4Rau2F", true, AddressParams::LIQUID),
+            ("ex1q7gkeyjut0mrxc3j0kjlt7rmcnvsh0gt45d3fud", false, AddressParams::LIQUID),
+            ("lq1qqf8er278e6nyvuwtgf39e6ewvdcnjupn9a86rzpx655y5lhkt0walu3djf9cklkxd3ryld97hu8h3xepw7sh2rlu7q45dcew5", true, AddressParams::LIQUID),
+        ];
+
+        for &(a, blinded, ref params) in &addresses {
+            let result = a.parse();
+            assert!(result.is_ok(), "vector: {}, err: \"{}\"", a, result.unwrap_err());
+            let addr: Address = result.unwrap();
+            assert_eq!(a, &addr.to_string(), "vector: {}", a);
+            assert_eq!(blinded, addr.is_blinded());
+            assert_eq!(params, addr.params);
             roundtrips(&addr);
         }
-
-        let invalid_vectors = [
-            "tc1qw508d6qejxtdg4y5r3zarvary0c5xw7kg3g4ty",
-            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5",
-            "BC13W508D6QEJXTDG4Y5R3ZARVARY0C5XW7KN40WF2",
-            "bc1rw5uspcuh",
-            "bc10w508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7kw5rljs90",
-            "BC1QR508D6QEJXTDG4Y5R3ZARVARYV98GJ9P",
-            "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sL5k7",
-            "bc1zw508d6qejxtdg4y5r3zarvaryvqyzf3du",
-            "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3pjxtptv",
-            "bc1gmk9yu",
-        ];
-        for vector in &invalid_vectors {
-            assert!(vector.parse::<Address>().is_err());
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "serde")]
-    fn test_json_serialize() {
-        use serde_json;
-
-        let addr = Address::from_str("132F25rTsvBdp9JzLLBHP5mvGY66i1xdiM").unwrap();
-        let json = serde_json::to_value(&addr).unwrap();
-        assert_eq!(
-            json,
-            serde_json::Value::String("132F25rTsvBdp9JzLLBHP5mvGY66i1xdiM".to_owned())
-        );
-        let into: Address = serde_json::from_value(json).unwrap();
-        assert_eq!(addr.to_string(), into.to_string());
-        assert_eq!(
-            into.script_pubkey(),
-            hex_script!("76a914162c5ea71c0b23f5b9022ef047c4a86470a5b07088ac")
-        );
-
-        let addr = Address::from_str("33iFwdLuRpW1uK1RTRqsoi8rR4NpDzk66k").unwrap();
-        let json = serde_json::to_value(&addr).unwrap();
-        assert_eq!(
-            json,
-            serde_json::Value::String("33iFwdLuRpW1uK1RTRqsoi8rR4NpDzk66k".to_owned())
-        );
-        let into: Address = serde_json::from_value(json).unwrap();
-        assert_eq!(addr.to_string(), into.to_string());
-        assert_eq!(
-            into.script_pubkey(),
-            hex_script!("a914162c5ea71c0b23f5b9022ef047c4a86470a5b07087")
-        );
-
-        let addr =
-            Address::from_str("tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7")
-                .unwrap();
-        let json = serde_json::to_value(&addr).unwrap();
-        assert_eq!(
-            json,
-            serde_json::Value::String(
-                "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7".to_owned()
-            )
-        );
-        let into: Address = serde_json::from_value(json).unwrap();
-        assert_eq!(addr.to_string(), into.to_string());
-        assert_eq!(
-            into.script_pubkey(),
-            hex_script!("00201863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262")
-        );
-
-        let addr = Address::from_str("bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl").unwrap();
-        let json = serde_json::to_value(&addr).unwrap();
-        assert_eq!(
-            json,
-            serde_json::Value::String("bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl".to_owned())
-        );
-        let into: Address = serde_json::from_value(json).unwrap();
-        assert_eq!(addr.to_string(), into.to_string());
-        assert_eq!(
-            into.script_pubkey(),
-            hex_script!("001454d26dddb59c7073c6a197946ea1841951fa7a74")
-        );
     }
 }

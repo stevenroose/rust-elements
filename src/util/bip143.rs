@@ -104,9 +104,8 @@ mod tests {
     use blockdata::script::Script;
     use blockdata::transaction::Transaction;
     use consensus::encode::deserialize;
-    use network::constants::Network;
     use util::misc::hex_bytes;
-    use util::address::Address;
+    use util::address::{Address, AddressParams};
     use util::key::PublicKey;
     use hex;
 
@@ -115,7 +114,7 @@ mod tests {
     fn p2pkh_hex(pk: &str) -> Script {
         let pk = hex::decode(pk).unwrap();
         let pk = PublicKey::from_slice(pk.as_slice()).unwrap();
-        let witness_script = Address::p2pkh(&pk, Network::Bitcoin).script_pubkey();
+        let witness_script = Address::p2pkh(&pk, None, &AddressParams::LIQUID).script_pubkey();
         witness_script
     }
 

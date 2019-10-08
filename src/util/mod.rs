@@ -31,6 +31,7 @@ pub mod uint;
 pub mod bip158;
 
 // elements:
+pub mod blech32;
 pub mod issuance;
 mod fast_merkle_root;
 pub use util::fast_merkle_root::fast_merkle_root;
