@@ -1,6 +1,6 @@
-// Rust Bitcoin Library
-// Written in 2014 by
-//   Andrew Poelstra <apoelstra@wpsoftware.net>
+// Rust Elements Library
+// Written in 2019 by
+//   The Elements developers
 //
 // To the extent possible under law, the author(s) have dedicated all
 // copyright and related and neighboring rights to this software to
@@ -12,10 +12,10 @@
 // If not, see <http://creativecommons.org/publicdomain/zero/1.0/>.
 //
 
-//! # Rust Bitcoin Library
+//! # Rust Elements Library
 //!
-//! This is a library for which supports the Bitcoin network protocol and associated
-//! primitives. It is designed for Rust programs built to work with the Bitcoin
+//! This is a library for which supports the Elements network protocol and associated
+//! primitives. It is designed for Rust programs built to work with the Elements
 //! network.
 //!
 //! It is also written entirely in Rust to illustrate the benefits of strong type
@@ -23,7 +23,7 @@
 //! software.
 //!
 
-#![crate_name = "bitcoin"]
+#![crate_name = "elements"]
 #![crate_type = "dylib"]
 #![crate_type = "rlib"]
 
@@ -61,7 +61,7 @@ extern crate hex;
 #[cfg(feature="bitcoinconsensus")] extern crate bitcoinconsensus;
 
 #[cfg(target_pointer_width = "16")]
-compile_error!("rust-bitcoin cannot be used on 16-bit architectures");
+compile_error!("rust-elements cannot be used on 16-bit architectures");
 
 #[cfg(test)]
 #[macro_use]
