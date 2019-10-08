@@ -30,6 +30,10 @@ pub mod psbt;
 pub mod uint;
 pub mod bip158;
 
+// elements:
+mod fast_merkle_root;
+pub use util::fast_merkle_root::fast_merkle_root;
+
 use std::{error, fmt};
 
 use network;
