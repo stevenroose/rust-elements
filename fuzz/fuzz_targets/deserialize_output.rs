@@ -1,14 +1,28 @@
+
 extern crate elements;
 
 fn do_test(data: &[u8]) {
-    let _: Result<elements::blockdata::block::Block, _>= elements::consensus::encode::deserialize(data);
+    let result: Result<elements::TxOut, _> = elements::consensus::encode::deserialize(data);
+    match result {
+        Err(_) => {},
+        Ok(output) => {
+            let reser = elements::consensus::encode::serialize(&output);
+            assert_eq!(data, &reser[..]);
+
+            output.is_null_data();
+            output.is_pegout();
+            output.pegout_data();
+            output.is_fee();
+            output.minimum_value();
+        },
+    }
 }
 
 #[cfg(feature = "afl")]
-#[macro_use] extern crate afl;
+extern crate afl;
 #[cfg(feature = "afl")]
 fn main() {
-    fuzz!(|data| {
+    afl::read_stdio_bytes(|data| {
         do_test(&data);
     });
 }
@@ -50,3 +64,4 @@ mod tests {
         super::do_test(&a);
     }
 }
+

@@ -1,8 +1,8 @@
-extern crate bitcoin;
+extern crate elements;
 use std::str::FromStr;
 fn do_test(data: &[u8]) {
     let data_str = String::from_utf8_lossy(data);
-    let addr = match bitcoin::util::address::Address::from_str(&data_str) {
+    let addr = match elements::util::address::Address::from_str(&data_str) {
         Ok(addr) => addr,
         Err(_) => return,
     };
