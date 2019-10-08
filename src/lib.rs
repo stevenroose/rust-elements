@@ -47,9 +47,10 @@
 
 
 // Re-exported dependencies.
-pub extern crate bitcoin_hashes as hashes;
-pub extern crate secp256k1;
-pub extern crate bech32;
+pub extern crate bitcoin;
+pub use bitcoin::hashes;
+pub use bitcoin::secp256k1;
+pub use bitcoin::bech32;
 
 extern crate byteorder;
 extern crate hex;
