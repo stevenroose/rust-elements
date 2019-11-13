@@ -16,7 +16,7 @@ documentation = "https://docs.rs/elements/"
 "fuzztarget" = []
 
 [dependencies]
-bitcoin = "0.20"
+bitcoin = { git = "git://github.com/stevenroose/rust-bitcoin", branch = "devel" }
 
 [dependencies.serde]
 version = "1.0"
