@@ -85,18 +85,19 @@ pub fn i64_to_array_le(val: i64) -> [u8; 8] {
     u64_to_array_le(val as u64)
 }
 
-macro_rules! define_chunk_slice_to_int {
-    ($name: ident, $type: ty, $converter: ident) => {
-        #[inline]
-        pub fn $name(inp: &[u8], outp: &mut [$type]) {
-            assert_eq!(inp.len(), outp.len() * ::std::mem::size_of::<$type>());
-            for (outp_val, data_bytes) in outp.iter_mut().zip(inp.chunks(::std::mem::size_of::<$type>())) {
-                *outp_val = $converter(data_bytes);
-            }
-        }
-    }
-}
-define_chunk_slice_to_int!(bytes_to_u64_slice_le, u64, slice_to_u64_le);
+// Elements: unused
+//macro_rules! define_chunk_slice_to_int {
+//    ($name: ident, $type: ty, $converter: ident) => {
+//        #[inline]
+//        pub fn $name(inp: &[u8], outp: &mut [$type]) {
+//            assert_eq!(inp.len(), outp.len() * ::std::mem::size_of::<$type>());
+//            for (outp_val, data_bytes) in outp.iter_mut().zip(inp.chunks(::std::mem::size_of::<$type>())) {
+//                *outp_val = $converter(data_bytes);
+//            }
+//        }
+//    }
+//}
+//define_chunk_slice_to_int!(bytes_to_u64_slice_le, u64, slice_to_u64_le);
 
 #[cfg(test)]
 mod tests {
@@ -115,11 +116,11 @@ mod tests {
         assert_eq!(u64_to_array_le(0x1badcafedeadbeef), [0xef, 0xbe, 0xad, 0xde, 0xfe, 0xca, 0xad, 0x1b]);
     }
 
-    #[test]
-    fn endian_chunk_test() {
-        let inp = [0xef, 0xbe, 0xad, 0xde, 0xfe, 0xca, 0xad, 0x1b, 0xfe, 0xca, 0xad, 0x1b, 0xce, 0xfa, 0x01, 0x02];
-        let mut out = [0; 2];
-        bytes_to_u64_slice_le(&inp, &mut out);
-        assert_eq!(out, [0x1badcafedeadbeef, 0x0201face1badcafe]);
-    }
+    //#[test]
+    //fn endian_chunk_test() {
+    //    let inp = [0xef, 0xbe, 0xad, 0xde, 0xfe, 0xca, 0xad, 0x1b, 0xfe, 0xca, 0xad, 0x1b, 0xce, 0xfa, 0x01, 0x02];
+    //    let mut out = [0; 2];
+    //    bytes_to_u64_slice_le(&inp, &mut out);
+    //    assert_eq!(out, [0x1badcafedeadbeef, 0x0201face1badcafe]);
+    //}
 }

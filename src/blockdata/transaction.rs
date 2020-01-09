@@ -1060,10 +1060,12 @@ mod tests {
     fn test_txin_default() {
         let txin = TxIn::default();
         assert_eq!(txin.previous_output, OutPoint::default());
-        assert_eq!(txin.script_sig, Script::new());
+        assert_eq!(txin.is_pegin, false);
+        assert_eq!(txin.has_issuance, false);
         assert_eq!(txin.sequence, 0xFFFFFFFF);
         assert_eq!(txin.previous_output, OutPoint::default());
-        assert_eq!(txin.witness.len(), 0 as usize);
+        assert_eq!(txin.asset_issuance, AssetIssuance::default());
+        assert_eq!(txin.witness, TxInWitness::default());
     }
 
     //TODO(stevenroose) elements genesis
@@ -1927,7 +1929,7 @@ mod tests {
             tx.input[0].pegin_data(),
             Some(super::PeginData {
                 outpoint: bitcoin::OutPoint {
-                    txid: sha256d::Hash::from_hex(
+                    txid: bitcoin::Txid::from_hex(
                         "c9d88eb5130365deed045eab11cfd3eea5ba32ad45fa2e156ae6ead5f1fce93f",
                     ).unwrap(),
                     vout: 0,

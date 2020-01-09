@@ -53,7 +53,8 @@
 
 // Re-exported dependencies.
 pub extern crate bitcoin;
-pub use bitcoin::hashes;
+#[macro_use]
+pub extern crate bitcoin_hashes as hashes;
 pub use bitcoin::secp256k1;
 pub use bitcoin::bech32;
 

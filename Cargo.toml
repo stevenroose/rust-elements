@@ -22,6 +22,7 @@ use-serde = ["hex", "serde", "bitcoin/use-serde"]
 
 [dependencies]
 bitcoin = "0.23.0"
+bitcoin_hashes = "0.7.3" # explicitly for newtype macros
 
 bitcoinconsensus = { version = "0.19.0-1", optional = true }
 serde = { version = "1", optional = true }
