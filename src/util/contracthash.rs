@@ -21,11 +21,12 @@
 use secp256k1::{self, Secp256k1};
 use PrivateKey;
 use PublicKey;
-use hashes::{hash160, sha256, Hash, HashEngine, Hmac, HmacEngine};
+use hashes::{sha256, Hash, HashEngine, Hmac, HmacEngine};
 use blockdata::{opcodes, script};
 
 use std::{error, fmt};
 
+use hash_types::ScriptHash;
 use util::address;
 
 /// Encoding of "pubkey here" in script; from Bitcoin Core `src/script/script.h`
@@ -208,7 +209,7 @@ pub fn create_address<C: secp256k1::Verification>(secp: &Secp256k1<C>,
     Ok(address::Address {
         params: params,
         payload: address::Payload::ScriptHash(
-            hash160::Hash::hash(&script[..])
+            ScriptHash::hash(&script[..])
         ),
 		blinding_pubkey: blinder,
     })

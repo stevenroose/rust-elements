@@ -23,7 +23,6 @@
 //! This module provides the structures and functions needed to support transactions.
 //!
 
-use byteorder::{LittleEndian, WriteBytesExt};
 use std::default::Default;
 use std::{fmt, io};
 
@@ -32,9 +31,11 @@ use hashes::{self, sha256d, Hash};
 use hashes::hex::FromHex;
 
 use util::hash::ElementsHash;
+use util::endian;
 #[cfg(feature="bitcoinconsensus")] use blockdata::script;
 use blockdata::script::{Script, Instruction};
 use consensus::{encode, serialize, Decodable, Encodable};
+use hash_types::*;
 use VarInt;
 use blockdata::confidential;
 use blockdata::opcodes;
@@ -43,7 +44,7 @@ use blockdata::opcodes;
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct OutPoint {
     /// The referenced transaction's txid
-    pub txid: sha256d::Hash,
+    pub txid: Txid,
     /// The index of the referenced output in its transaction's vout
     pub vout: u32,
 }
@@ -52,7 +53,7 @@ serde_struct_human_string_impl!(OutPoint, "an Elements OutPoint", txid, vout);
 impl OutPoint {
     /// Create a new [OutPoint].
     #[inline]
-    pub fn new(txid: sha256d::Hash, vout: u32) -> OutPoint {
+    pub fn new(txid: Txid, vout: u32) -> OutPoint {
         OutPoint {
             txid: txid,
             vout: vout,
@@ -103,7 +104,7 @@ impl fmt::Display for OutPoint {
     }
 }
 
-impl ElementsHash for OutPoint {
+impl ElementsHash<sha256d::Hash> for OutPoint {
     fn elements_hash(&self) -> sha256d::Hash {
         let mut enc = sha256d::Hash::engine();
         self.consensus_encode(&mut enc).unwrap();
@@ -189,7 +190,7 @@ impl ::std::str::FromStr for OutPoint {
             return Err(ParseOutPointError::Format);
         }
         Ok(OutPoint {
-            txid: sha256d::Hash::from_hex(&s[..colon]).map_err(ParseOutPointError::Txid)?,
+            txid: Txid::from_hex(&s[..colon]).map_err(ParseOutPointError::Txid)?,
             vout: parse_vout(&s[colon+1..])?,
         })
     }
@@ -318,7 +319,7 @@ impl TxIn {
         Some(PeginData {
             // "Cast" of an elements::OutPoint to a bitcoin::OutPoint
             outpoint: bitcoin::OutPoint {
-                txid: self.previous_output.txid,
+                txid: self.previous_output.txid.as_hash().into(),
                 vout: self.previous_output.vout,
             },
             value: opt_try!(bitcoin::consensus::deserialize(&self.witness.pegin_witness[0])),
@@ -371,6 +372,20 @@ impl TxOutWitness {
     /// Whether this witness is null
     pub fn is_empty(&self) -> bool {
         self.surjection_proof.is_empty() && self.rangeproof.is_empty()
+    }
+}
+
+impl Default for TxIn {
+    fn default() -> TxIn {
+        TxIn {
+            previous_output: OutPoint::default(),
+            is_pegin: false,
+            has_issuance: false,
+            script_sig: Script::new(),
+            sequence: u32::max_value(),
+            asset_issuance: AssetIssuance::default(),
+            witness: TxInWitness::default(),
+        }
     }
 }
 
@@ -577,14 +592,23 @@ impl Transaction {
     /// to the output of `ElementsHash::elements_hash()`, but for segwit transactions,
     /// this will give the correct txid (not including witnesses) while `elements_hash`
     /// will also hash witnesses.
-    pub fn txid(&self) -> sha256d::Hash {
-        let mut enc = sha256d::Hash::engine();
+    pub fn txid(&self) -> Txid {
+        let mut enc = Txid::engine();
         self.version.consensus_encode(&mut enc).unwrap();
         0u8.consensus_encode(&mut enc).unwrap();
         self.input.consensus_encode(&mut enc).unwrap();
         self.output.consensus_encode(&mut enc).unwrap();
         self.lock_time.consensus_encode(&mut enc).unwrap();
-        sha256d::Hash::from_engine(enc)
+        Txid::from_engine(enc)
+    }
+
+    /// Computes SegWit-version of the transaction id (wtxid). For transaction with the witness
+    /// data this hash includes witness, for pre-witness transaction it is equal to the normal
+    /// value returned by txid() function.
+    pub fn wtxid(&self) -> Wtxid {
+        let mut enc = Wtxid::engine();
+        self.consensus_encode(&mut enc).unwrap();
+        Wtxid::from_engine(enc)
     }
 
     /// Computes a signature hash for a given input index with a given sighash flag.
@@ -600,14 +624,14 @@ impl Transaction {
     /// # Panics
     /// Panics if `input_index` is greater than or equal to `self.input.len()`
     ///
-    pub fn signature_hash(&self, input_index: usize, script_pubkey: &Script, sighash_u32: u32) -> sha256d::Hash {
+    pub fn signature_hash(&self, input_index: usize, script_pubkey: &Script, sighash_u32: u32) -> SigHash {
         assert!(input_index < self.input.len());  // Panic on OOB
 
         let (sighash, anyone_can_pay) = SigHashType::from_u32(sighash_u32).split_anyonecanpay_flag();
 
         // Special-case sighash_single bug because this is easy enough.
         if sighash == SigHashType::Single && input_index >= self.output.len() {
-            return sha256d::Hash::from_slice(&[1, 0, 0, 0, 0, 0, 0, 0,
+            return SigHash::from_slice(&[1, 0, 0, 0, 0, 0, 0, 0,
                                                0, 0, 0, 0, 0, 0, 0, 0,
                                                0, 0, 0, 0, 0, 0, 0, 0,
                                                0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
@@ -660,8 +684,8 @@ impl Transaction {
         };
         // hash the result
         let mut raw_vec = serialize(&tx);
-        raw_vec.write_u32::<LittleEndian>(sighash_u32).unwrap();
-        sha256d::Hash::hash(&raw_vec)
+        raw_vec.extend_from_slice(&endian::u32_to_array_le(sighash_u32));
+        SigHash::hash(&raw_vec)
     }
 
     /// Gets the "weight" of this transaction, as defined by BIP141. For transactions with an empty
@@ -751,11 +775,11 @@ impl Transaction {
     }
 }
 
-impl ElementsHash for Transaction {
-    fn elements_hash(&self) -> sha256d::Hash {
+impl ElementsHash<Txid> for Transaction {
+    fn elements_hash(&self) -> Txid {
         let mut enc = sha256d::Hash::engine();
         self.consensus_encode(&mut enc).unwrap();
-        sha256d::Hash::from_engine(enc)
+        Txid::from_engine(enc)
     }
 }
 
@@ -980,7 +1004,7 @@ impl SigHashType {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutPoint, ParseOutPointError, Transaction, TxIn, TxOut, AssetIssuance};
+    use super::*;
     use std::str::FromStr;
 
 	use bitcoin;
@@ -992,7 +1016,6 @@ mod tests {
     use consensus::encode::serialize;
     use consensus::encode::deserialize;
     use util::hash::ElementsHash;
-    use util::misc::hex_bytes;
 
     #[test]
     fn test_outpoint() {
@@ -1009,31 +1032,41 @@ mod tests {
         assert_eq!(OutPoint::from_str("5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456:+42"),
                    Err(ParseOutPointError::VoutNotCanonical));
         assert_eq!(OutPoint::from_str("i don't care:1"),
-                   Err(ParseOutPointError::Txid(sha256d::Hash::from_hex("i don't care").unwrap_err())));
+                   Err(ParseOutPointError::Txid(Txid::from_hex("i don't care").unwrap_err())));
         assert_eq!(OutPoint::from_str("5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c945X:1"),
-                   Err(ParseOutPointError::Txid(sha256d::Hash::from_hex("5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c945X").unwrap_err())));
+                   Err(ParseOutPointError::Txid(Txid::from_hex("5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c945X").unwrap_err())));
         assert_eq!(OutPoint::from_str("5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456:lol"),
                    Err(ParseOutPointError::Vout(u32::from_str("lol").unwrap_err())));
  
         assert_eq!(OutPoint::from_str("5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456:42"),
                    Ok(OutPoint{
-                       txid: sha256d::Hash::from_hex("5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456").unwrap(),
+                       txid: Txid::from_hex("5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456").unwrap(),
                        vout: 42,
                    }));
         assert_eq!(OutPoint::from_str("5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456:0"),
                    Ok(OutPoint{
-                       txid: sha256d::Hash::from_hex("5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456").unwrap(),
+                       txid: Txid::from_hex("5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456").unwrap(),
                        vout: 0,
                    }));
     }
 
     #[test]
     fn test_txin() {
-        let txin: Result<TxIn, _> = deserialize(&hex_bytes("a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff").unwrap());
+        let txin: Result<TxIn, _> = deserialize(&Vec::<u8>::from_hex("a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff").unwrap());
         assert!(txin.is_ok());
     }
 
-	//TODO(stevenroose) elements genesis
+    #[test]
+    fn test_txin_default() {
+        let txin = TxIn::default();
+        assert_eq!(txin.previous_output, OutPoint::default());
+        assert_eq!(txin.script_sig, Script::new());
+        assert_eq!(txin.sequence, 0xFFFFFFFF);
+        assert_eq!(txin.previous_output, OutPoint::default());
+        assert_eq!(txin.witness.len(), 0 as usize);
+    }
+
+    //TODO(stevenroose) elements genesis
     //#[test]
     //fn test_is_coinbase () {
     //    use network::constants::Network;
@@ -1041,14 +1074,14 @@ mod tests {
 
     //    let genesis = constants::genesis_block(Network::Bitcoin);
     //    assert! (genesis.txdata[0].is_coin_base());
-    //    let hex_tx = hex_bytes("0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000").unwrap();
+    //    let hex_tx = Vec::<u8>::from_hex("0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000").unwrap();
     //    let tx: Transaction = deserialize(&hex_tx).unwrap();
     //    assert!(!tx.is_coin_base());
     //}
 
     #[test]
-    fn test_transaction() {
-        let hex_tx = hex_bytes("0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000").unwrap();
+    fn test_nonsegwit_transaction() {
+        let hex_tx = Vec::<u8>::from_hex("0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000").unwrap();
         let tx: Result<Transaction, _> = deserialize(&hex_tx);
         assert!(tx.is_ok());
         let realtx = tx.unwrap();
@@ -1066,12 +1099,47 @@ mod tests {
 
         assert_eq!(format!("{:x}", realtx.elements_hash()),
                    "a6eab3c14ab5272a58a5ba91505ba1a4b6d7a3a9fcbd187b6cd99a7b6d548cb7".to_string());
+        assert_eq!(format!("{:x}", realtx.txid()),
+                   "a6eab3c14ab5272a58a5ba91505ba1a4b6d7a3a9fcbd187b6cd99a7b6d548cb7".to_string());
+        assert_eq!(format!("{:x}", realtx.wtxid()),
+                   "a6eab3c14ab5272a58a5ba91505ba1a4b6d7a3a9fcbd187b6cd99a7b6d548cb7".to_string());
         assert_eq!(realtx.get_weight(), 193*4);
     }
 
     #[test]
+    fn test_segwit_transaction() {
+        let hex_tx = Vec::<u8>::from_hex(
+            "02000000000101595895ea20179de87052b4046dfe6fd515860505d6511a9004cf12a1f93cac7c01000000\
+            00ffffffff01deb807000000000017a9140f3444e271620c736808aa7b33e370bd87cb5a078702483045022\
+            100fb60dad8df4af2841adc0346638c16d0b8035f5e3f3753b88db122e70c79f9370220756e6633b17fd271\
+            0e626347d28d60b0a2d6cbb41de51740644b9fb3ba7751040121028fa937ca8cba2197a37c007176ed89410\
+            55d3bcb8627d085e94553e62f057dcc00000000"
+        ).unwrap();
+        let tx: Result<Transaction, _> = deserialize(&hex_tx);
+        assert!(tx.is_ok());
+        let realtx = tx.unwrap();
+        // All these tests aren't really needed because if they fail, the hash check at the end
+        // will also fail. But these will show you where the failure is so I'll leave them in.
+        assert_eq!(realtx.version, 2);
+        assert_eq!(realtx.input.len(), 1);
+        // In particular this one is easy to get backward -- in bitcoin hashes are encoded
+        // as little-endian 256-bit numbers rather than as data strings.
+        assert_eq!(format!("{:x}", realtx.input[0].previous_output.txid),
+                   "7cac3cf9a112cf04901a51d605058615d56ffe6d04b45270e89d1720ea955859".to_string());
+        assert_eq!(realtx.input[0].previous_output.vout, 1);
+        assert_eq!(realtx.output.len(), 1);
+        assert_eq!(realtx.lock_time, 0);
+
+        assert_eq!(format!("{:x}", realtx.txid()),
+                   "f5864806e3565c34d1b41e716f72609d00b55ea5eac5b924c9719a842ef42206".to_string());
+        assert_eq!(format!("{:x}", realtx.wtxid()),
+                   "80b7d8a82d5d5bf92905b06f2014dd699e03837ca172e3a59d51426ebbe3e7f5".to_string());
+        assert_eq!(realtx.get_weight(), 442);
+    }
+
+    #[test]
     fn tx_no_input_deserialization() {
-        let hex_tx = hex_bytes(
+        let hex_tx = Vec::<u8>::from_hex(
             "010000000001000100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000"
         ).unwrap();
         let tx: Transaction = deserialize(&hex_tx).expect("deserialize tx");
@@ -1086,7 +1154,7 @@ mod tests {
     #[test]
     fn test_txid() {
         // segwit tx from Liquid integration tests, txid/hash from Core decoderawtransaction
-        let hex_tx = hex_bytes(
+        let hex_tx = Vec::<u8>::from_hex(
             "01000000000102ff34f95a672bb6a4f6ff4a7e90fa8c7b3be7e70ffc39bc99be3bda67942e836c00000000\
              23220020cde476664d3fa347b8d54ef3aee33dcb686a65ced2b5207cbf4ec5eda6b9b46e4f414d4c934ad8\
              1d330314e888888e3bd22c7dde8aac2ca9227b30d7c40093248af7812201000000232200200af6f6a071a6\
@@ -1119,11 +1187,12 @@ mod tests {
         let tx: Transaction = deserialize(&hex_tx).unwrap();
 
         assert_eq!(format!("{:x}", tx.elements_hash()), "d6ac4a5e61657c4c604dcde855a1db74ec6b3e54f32695d72c5e11c7761ea1b4");
+        assert_eq!(format!("{:x}", tx.wtxid()), "d6ac4a5e61657c4c604dcde855a1db74ec6b3e54f32695d72c5e11c7761ea1b4");
         assert_eq!(format!("{:x}", tx.txid()), "9652aa62b0e748caeec40c4cb7bc17c6792435cc3dfe447dd1ca24f912a1c6ec");
         assert_eq!(tx.get_weight(), 2718);
 
         // non-segwit tx from my mempool
-        let hex_tx = hex_bytes(
+        let hex_tx = Vec::<u8>::from_hex(
             "01000000010c7196428403d8b0c88fcb3ee8d64f56f55c8973c9ab7dd106bb4f3527f5888d000000006a47\
              30440220503a696f55f2c00eee2ac5e65b17767cd88ed04866b5637d3c1d5d996a70656d02202c9aff698f\
              343abb6d176704beda63fcdec503133ea4f6a5216b7f925fa9910c0121024d89b5a13d6521388969209df2\
@@ -1134,23 +1203,24 @@ mod tests {
         let tx: Transaction = deserialize(&hex_tx).unwrap();
 
         assert_eq!(format!("{:x}", tx.elements_hash()), "971ed48a62c143bbd9c87f4bafa2ef213cfa106c6e140f111931d0be307468dd");
+        assert_eq!(format!("{:x}", tx.wtxid()), "971ed48a62c143bbd9c87f4bafa2ef213cfa106c6e140f111931d0be307468dd");
         assert_eq!(format!("{:x}", tx.txid()), "971ed48a62c143bbd9c87f4bafa2ef213cfa106c6e140f111931d0be307468dd");
     }
 
     #[test]
     #[cfg(feature = "serde")]
     fn test_txn_encode_decode() {
-        let hex_tx = hex_bytes("0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000").unwrap();
+        let hex_tx = Vec::<u8>::from_hex("0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000").unwrap();
         let tx: Transaction = deserialize(&hex_tx).unwrap();
         serde_round_trip!(tx);
     }
 
     fn run_test_sighash(tx: &str, script: &str, input_index: usize, hash_type: i32, expected_result: &str) {
-        let tx: Transaction = deserialize(&hex_bytes(tx).unwrap()[..]).unwrap();
-        let script = Script::from(hex_bytes(script).unwrap());
-        let mut raw_expected = hex_bytes(expected_result).unwrap();
+        let tx: Transaction = deserialize(&Vec::<u8>::from_hex(tx).unwrap()[..]).unwrap();
+        let script = Script::from(Vec::<u8>::from_hex(script).unwrap());
+        let mut raw_expected = Vec::<u8>::from_hex(expected_result).unwrap();
         raw_expected.reverse();
-        let expected_result = sha256d::Hash::from_slice(&raw_expected[..]).unwrap();
+        let expected_result = SigHash::from_slice(&raw_expected[..]).unwrap();
 
         let actual_result = tx.signature_hash(input_index, &script, hash_type as u32);
         assert_eq!(actual_result, expected_result);
@@ -1161,7 +1231,7 @@ mod tests {
     #[test]
     #[cfg(feature = "serde")]
     fn test_segwit_tx_decode() {
-        let hex_tx = hex_bytes("010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff3603da1b0e00045503bd5704c7dd8a0d0ced13bb5785010800000000000a636b706f6f6c122f4e696e6a61506f6f6c2f5345475749542fffffffff02b4e5a212000000001976a914876fbb82ec05caa6af7a3b5e5a983aae6c6cc6d688ac0000000000000000266a24aa21a9edf91c46b49eb8a29089980f02ee6b57e7d63d33b18b4fddac2bcd7db2a39837040120000000000000000000000000000000000000000000000000000000000000000000000000").unwrap();
+        let hex_tx = Vec::<u8>::from_hex("010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff3603da1b0e00045503bd5704c7dd8a0d0ced13bb5785010800000000000a636b706f6f6c122f4e696e6a61506f6f6c2f5345475749542fffffffff02b4e5a212000000001976a914876fbb82ec05caa6af7a3b5e5a983aae6c6cc6d688ac0000000000000000266a24aa21a9edf91c46b49eb8a29089980f02ee6b57e7d63d33b18b4fddac2bcd7db2a39837040120000000000000000000000000000000000000000000000000000000000000000000000000").unwrap();
         let tx: Transaction = deserialize(&hex_tx).unwrap();
         assert_eq!(tx.get_weight(), 780);
         serde_round_trip!(tx);
@@ -1527,7 +1597,7 @@ mod tests {
         let txid = "d0a5c455ea7221dead9513596d2f97c09943bad81a386fe61a14a6cda060e422";
         let s = format!("{}:42", txid);
         let expected = OutPoint {
-            txid: sha256d::Hash::from_hex(&txid).unwrap(),
+            txid: Txid::from_hex(&txid).unwrap(),
             vout: 42,
         };
         let op = ::std::str::FromStr::from_str(&s).ok();

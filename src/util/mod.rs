@@ -30,6 +30,8 @@ pub mod psbt;
 pub mod uint;
 pub mod bip158;
 
+pub(crate) mod endian;
+
 // elements:
 pub mod blech32;
 pub mod issuance;

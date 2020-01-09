@@ -57,7 +57,3 @@ pub fn genesis_block(_network: Network) -> Block {
 	unimplemented!()
 }
 
-#[cfg(test)]
-mod test {
-}
-

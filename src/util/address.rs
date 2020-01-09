@@ -22,9 +22,10 @@ use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
 use bech32::{self, FromBase32, ToBase32};
-use hashes::{hash160, sha256, Hash};
 use secp256k1;
+use hashes::Hash;
 
+use hash_types::{PubkeyHash, WPubkeyHash, ScriptHash, WScriptHash};
 use blockdata::opcodes;
 use blockdata::script;
 use util::base58;
@@ -179,9 +180,9 @@ impl AddressParams {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Payload {
     /// pay-to-pkhash address
-    PubkeyHash(hash160::Hash),
+    PubkeyHash(PubkeyHash),
     /// P2SH address
-    ScriptHash(hash160::Hash),
+    ScriptHash(ScriptHash),
     /// Segwit address
     WitnessProgram {
         /// The witness program version
@@ -195,9 +196,9 @@ impl Payload {
     /// Get a [Payload] from an output script (scriptPubkey).
     pub fn from_script(script: &script::Script) -> Option<Payload> {
         Some(if script.is_p2pkh() {
-            Payload::PubkeyHash(Hash::from_slice(&script.as_bytes()[3..23]).unwrap())
+            Payload::PubkeyHash(PubkeyHash::from_slice(&script.as_bytes()[3..23]).unwrap())
         } else if script.is_p2sh() {
-            Payload::ScriptHash(Hash::from_slice(&script.as_bytes()[2..22]).unwrap())
+            Payload::ScriptHash(ScriptHash::from_slice(&script.as_bytes()[2..22]).unwrap())
         } else if script.is_witness_program() {
             // We can unwrap the u5 check and assume script length
             // because [Script::is_witness_program] makes sure of this.
@@ -273,12 +274,12 @@ impl Address {
         blinder: Option<secp256k1::PublicKey>,
         params: &'static AddressParams,
     ) -> Address {
-        let mut hash_engine = hash160::Hash::engine();
+        let mut hash_engine = PubkeyHash::engine();
         pk.write_into(&mut hash_engine);
 
         Address {
             params: params,
-            payload: Payload::PubkeyHash(hash160::Hash::from_engine(hash_engine)),
+            payload: Payload::PubkeyHash(PubkeyHash::from_engine(hash_engine)),
             blinding_pubkey: blinder,
         }
     }
@@ -293,7 +294,7 @@ impl Address {
     ) -> Address {
         Address {
             params: params,
-            payload: Payload::ScriptHash(hash160::Hash::hash(&script[..])),
+            payload: Payload::ScriptHash(ScriptHash::hash(&script[..])),
             blinding_pubkey: blinder,
         }
     }
@@ -305,14 +306,14 @@ impl Address {
         blinder: Option<secp256k1::PublicKey>,
         params: &'static AddressParams,
     ) -> Address {
-        let mut hash_engine = hash160::Hash::engine();
+        let mut hash_engine = WPubkeyHash::engine();
         pk.write_into(&mut hash_engine);
 
         Address {
             params: params,
             payload: Payload::WitnessProgram {
                 version: bech32::u5::try_from_u8(0).expect("0<32"),
-                program: hash160::Hash::from_engine(hash_engine)[..].to_vec(),
+                program: WPubkeyHash::from_engine(hash_engine)[..].to_vec(),
             },
             blinding_pubkey: blinder,
         }
@@ -325,16 +326,16 @@ impl Address {
         blinder: Option<secp256k1::PublicKey>,
         params: &'static AddressParams,
     ) -> Address {
-        let mut hash_engine = hash160::Hash::engine();
+        let mut hash_engine = WPubkeyHash::engine();
         pk.write_into(&mut hash_engine);
 
         let builder = script::Builder::new()
             .push_int(0)
-            .push_slice(&hash160::Hash::from_engine(hash_engine)[..]);
+            .push_slice(&WPubkeyHash::from_engine(hash_engine)[..]);
 
         Address {
             params: params,
-            payload: Payload::ScriptHash(hash160::Hash::hash(builder.into_script().as_bytes())),
+            payload: Payload::ScriptHash(ScriptHash::hash(builder.into_script().as_bytes())),
             blinding_pubkey: blinder,
         }
     }
@@ -349,7 +350,7 @@ impl Address {
             params: params,
             payload: Payload::WitnessProgram {
                 version: bech32::u5::try_from_u8(0).expect("0<32"),
-                program: sha256::Hash::hash(&script[..])[..].to_vec(),
+                program: WScriptHash::hash(&script[..])[..].to_vec(),
             },
             blinding_pubkey: blinder,
         }
@@ -364,12 +365,12 @@ impl Address {
     ) -> Address {
         let ws = script::Builder::new()
             .push_int(0)
-            .push_slice(&sha256::Hash::hash(&script[..])[..])
+            .push_slice(&WScriptHash::hash(&script[..])[..])
             .into_script();
 
         Address {
             params: params,
-            payload: Payload::ScriptHash(hash160::Hash::hash(&ws[..])),
+            payload: Payload::ScriptHash(ScriptHash::hash(&ws[..])),
             blinding_pubkey: blinder,
         }
     }
@@ -518,9 +519,9 @@ impl Address {
         };
 
         let payload = if prefix == params.p2pkh_prefix {
-            Payload::PubkeyHash(hash160::Hash::from_slice(payload_data).unwrap())
+            Payload::PubkeyHash(PubkeyHash::from_slice(payload_data).unwrap())
         } else if prefix == params.p2sh_prefix {
-            Payload::ScriptHash(hash160::Hash::from_slice(payload_data).unwrap())
+            Payload::ScriptHash(ScriptHash::from_slice(payload_data).unwrap())
         } else {
             return Err(base58::Error::InvalidVersion(vec![prefix]))?;
         };

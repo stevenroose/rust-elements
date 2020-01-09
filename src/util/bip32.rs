@@ -17,17 +17,16 @@
 //! at https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki
 
 use std::default::Default;
-use std::io::Cursor;
 use std::{error, fmt};
 use std::str::FromStr;
 #[cfg(feature = "serde")] use serde;
 
-use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
-use hashes::{hex, hash160, sha512, Hash, HashEngine, Hmac, HmacEngine};
+use hash_types::XpubIdentifier;
+use hashes::{hex, sha512, Hash, HashEngine, Hmac, HmacEngine};
 use secp256k1::{self, Secp256k1};
 
 use network::constants::Network;
-use util::base58;
+use util::{base58, endian};
 use util::key::{PublicKey, PrivateKey};
 
 /// A chain code
@@ -448,7 +447,6 @@ impl ExtendedPrivKey {
     /// Private->Private child key derivation
     pub fn ckd_priv<C: secp256k1::Signing>(&self, secp: &Secp256k1<C>, i: ChildNumber) -> Result<ExtendedPrivKey, Error> {
         let mut hmac_engine: HmacEngine<sha512::Hash> = HmacEngine::new(&self.chain_code[..]);
-        let mut be_n = [0; 4];
         match i {
             ChildNumber::Normal {..} => {
                 // Non-hardened key: compute public data and use that
@@ -460,9 +458,8 @@ impl ExtendedPrivKey {
                 hmac_engine.input(&self.private_key[..]);
             }
         }
-        BigEndian::write_u32(&mut be_n, u32::from(i));
 
-        hmac_engine.input(&be_n);
+        hmac_engine.input(&endian::u32_to_array_be(u32::from(i)));
         let hmac_result: Hmac<sha512::Hash> = Hmac::from_engine(hmac_engine);
         let mut sk = PrivateKey {
             compressed: true,
@@ -482,7 +479,7 @@ impl ExtendedPrivKey {
     }
 
     /// Returns the HASH160 of the chaincode
-    pub fn identifier<C: secp256k1::Signing>(&self, secp: &Secp256k1<C>) -> hash160::Hash {
+    pub fn identifier<C: secp256k1::Signing>(&self, secp: &Secp256k1<C>) -> XpubIdentifier {
         ExtendedPubKey::from_private(secp, self).identifier()
     }
 
@@ -529,9 +526,7 @@ impl ExtendedPubKey {
             ChildNumber::Normal { index: n } => {
                 let mut hmac_engine: HmacEngine<sha512::Hash> = HmacEngine::new(&self.chain_code[..]);
                 hmac_engine.input(&self.public_key.key.serialize()[..]);
-                let mut be_n = [0; 4];
-                BigEndian::write_u32(&mut be_n, n);
-                hmac_engine.input(&be_n);
+                hmac_engine.input(&endian::u32_to_array_be(n));
 
                 let hmac_result: Hmac<sha512::Hash> = Hmac::from_engine(hmac_engine);
 
@@ -567,10 +562,10 @@ impl ExtendedPubKey {
     }
 
     /// Returns the HASH160 of the chaincode
-    pub fn identifier(&self) -> hash160::Hash {
-        let mut engine = hash160::Hash::engine();
+    pub fn identifier(&self) -> XpubIdentifier {
+        let mut engine = XpubIdentifier::engine();
         self.public_key.write_into(&mut engine);
-        hash160::Hash::from_engine(engine)
+        XpubIdentifier::from_engine(engine)
     }
 
     /// Returns the first four bytes of the identifier
@@ -588,9 +583,7 @@ impl fmt::Display for ExtendedPrivKey {
         }[..]);
         ret[4] = self.depth as u8;
         ret[5..9].copy_from_slice(&self.parent_fingerprint[..]);
-
-        BigEndian::write_u32(&mut ret[9..13], u32::from(self.child_number));
-
+        ret[9..13].copy_from_slice(&endian::u32_to_array_be(u32::from(self.child_number)));
         ret[13..45].copy_from_slice(&self.chain_code[..]);
         ret[45] = 0;
         ret[46..78].copy_from_slice(&self.private_key[..]);
@@ -608,7 +601,7 @@ impl FromStr for ExtendedPrivKey {
             return Err(base58::Error::InvalidLength(data.len()));
         }
 
-        let cn_int: u32 = Cursor::new(&data[9..13]).read_u32::<BigEndian>().unwrap();
+        let cn_int: u32 = endian::slice_to_u32_be(&data[9..13]);
         let child_number: ChildNumber = ChildNumber::from(cn_int);
 
         let network = if &data[0..4] == [0x04u8, 0x88, 0xAD, 0xE4] {
@@ -647,9 +640,7 @@ impl fmt::Display for ExtendedPubKey {
         }[..]);
         ret[4] = self.depth as u8;
         ret[5..9].copy_from_slice(&self.parent_fingerprint[..]);
-
-        BigEndian::write_u32(&mut ret[9..13], u32::from(self.child_number));
-
+        ret[9..13].copy_from_slice(&endian::u32_to_array_be(u32::from(self.child_number)));
         ret[13..45].copy_from_slice(&self.chain_code[..]);
         ret[45..78].copy_from_slice(&self.public_key.key.serialize()[..]);
         fmt.write_str(&base58::check_encode_slice(&ret[..]))
@@ -666,7 +657,7 @@ impl FromStr for ExtendedPubKey {
             return Err(base58::Error::InvalidLength(data.len()));
         }
 
-        let cn_int: u32 = Cursor::new(&data[9..13]).read_u32::<BigEndian>().unwrap();
+        let cn_int: u32 = endian::slice_to_u32_be(&data[9..13]);
         let child_number: ChildNumber = ChildNumber::from(cn_int);
 
         Ok(ExtendedPubKey {

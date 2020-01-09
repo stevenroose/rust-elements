@@ -29,19 +29,15 @@
 //! big-endian decimals, etc.)
 //!
 
-use std::{mem, u32};
-
-use std::error;
-use std::fmt;
-use std::io;
+use std::{fmt, error, io, mem, u32};
+use std::borrow::Cow;
 use std::io::{Cursor, Read, Write};
-use byteorder::{LittleEndian, WriteBytesExt, ReadBytesExt};
-use hex::encode as hex_encode;
+use hashes::hex::ToHex;
 
-use hashes::{sha256d, Hash as HashTrait};
-use secp256k1;
+use hashes::{sha256d, Hash};
+use hash_types::{BlockHash, FilterHash, TxMerkleNode};
 
-use util::base58;
+use util::endian;
 use util::psbt;
 
 use blockdata::transaction::{TxOut, Transaction, TxIn};
@@ -53,12 +49,6 @@ use network::address::Address;
 pub enum Error {
     /// And I/O error
     Io(io::Error),
-    /// Base58 encoding error
-    Base58(base58::Error),
-    /// Error from the `byteorder` crate
-    ByteOrder(io::Error),
-    /// secp-related error
-    Secp256k1(secp256k1::Error),
     /// PSBT-related error
     Psbt(psbt::Error),
     /// Network magic was not expected
@@ -82,6 +72,8 @@ pub enum Error {
         /// The invalid checksum
         actual: [u8; 4],
     },
+    /// VarInt was encoded in a non-minimal way
+    NonMinimalVarInt,
     /// Network magic was unknown
     UnknownNetworkMagic(u32),
     /// Parsing error
@@ -90,26 +82,29 @@ pub enum Error {
     UnsupportedSegwitFlag(u8),
     /// Unrecognized network command
     UnrecognizedNetworkCommand(String),
-    /// Unexpected hex digit
-    UnexpectedHexDigit(char),
+    /// Invalid Inventory type
+    UnknownInventoryType(u32),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            Error::Io(ref e) => fmt::Display::fmt(e, f),
-            Error::Base58(ref e) => fmt::Display::fmt(e, f),
-            Error::ByteOrder(ref e) => fmt::Display::fmt(e, f),
-            Error::Secp256k1(ref e) => fmt::Display::fmt(e, f),
-            Error::Psbt(ref e) => fmt::Display::fmt(e, f),
-            Error::UnexpectedNetworkMagic { expected: ref e, actual: ref a } => write!(f, "{}: expected {}, actual {}", error::Error::description(self), e, a),
-            Error::OversizedVectorAllocation { requested: ref r, max: ref m } => write!(f, "{}: requested {}, maximum {}", error::Error::description(self), r, m),
-            Error::InvalidChecksum { expected: ref e, actual: ref a } => write!(f, "{}: expected {}, actual {}", error::Error::description(self), hex_encode(e), hex_encode(a)),
-            Error::UnknownNetworkMagic(ref m) => write!(f, "{}: {}", error::Error::description(self), m),
-            Error::ParseFailed(ref e) => write!(f, "{}: {}", error::Error::description(self), e),
-            Error::UnsupportedSegwitFlag(ref swflag) => write!(f, "{}: {}", error::Error::description(self), swflag),
-            Error::UnrecognizedNetworkCommand(ref nwcmd) => write!(f, "{}: {}", error::Error::description(self), nwcmd),
-            Error::UnexpectedHexDigit(ref d) => write!(f, "{}: {}", error::Error::description(self), d),
+            Error::Io(ref e) => write!(f, "I/O error: {}", e),
+            Error::Psbt(ref e) => write!(f, "PSBT error: {}", e),
+            Error::UnexpectedNetworkMagic { expected: ref e, actual: ref a } => write!(f,
+                "unexpected network magic: expected {}, actual {}", e, a),
+            Error::OversizedVectorAllocation { requested: ref r, max: ref m } => write!(f,
+                "allocation of oversized vector: requested {}, maximum {}", r, m),
+            Error::InvalidChecksum { expected: ref e, actual: ref a } => write!(f,
+                "invalid checksum: expected {}, actual {}", e.to_hex(), a.to_hex()),
+            Error::NonMinimalVarInt => write!(f, "non-minimal varint"),
+            Error::UnknownNetworkMagic(ref m) => write!(f, "unknown network magic: {}", m),
+            Error::ParseFailed(ref e) => write!(f, "parse failed: {}", e),
+            Error::UnsupportedSegwitFlag(ref swflag) => write!(f,
+                "unsupported segwit version: {}", swflag),
+            Error::UnrecognizedNetworkCommand(ref nwcmd) => write!(f,
+                "unrecognized network command: {}", nwcmd),
+            Error::UnknownInventoryType(ref tp) => write!(f, "Unknown Inventory type: {}", tp),
         }
     }
 }
@@ -118,53 +113,25 @@ impl error::Error for Error {
     fn cause(&self) -> Option<&error::Error> {
         match *self {
             Error::Io(ref e) => Some(e),
-            Error::Base58(ref e) => Some(e),
-            Error::ByteOrder(ref e) => Some(e),
-            Error::Secp256k1(ref e) => Some(e),
             Error::Psbt(ref e) => Some(e),
             Error::UnexpectedNetworkMagic { .. }
             | Error::OversizedVectorAllocation { .. }
             | Error::InvalidChecksum { .. }
+            | Error::NonMinimalVarInt
             | Error::UnknownNetworkMagic(..)
             | Error::ParseFailed(..)
             | Error::UnsupportedSegwitFlag(..)
             | Error::UnrecognizedNetworkCommand(..)
-            | Error::UnexpectedHexDigit(..) => None,
+            | Error::UnknownInventoryType(..) => None,
         }
     }
 
     fn description(&self) -> &str {
-        match *self {
-            Error::Io(ref e) => e.description(),
-            Error::Base58(ref e) => e.description(),
-            Error::ByteOrder(ref e) => e.description(),
-            Error::Secp256k1(ref e) => e.description(),
-            Error::Psbt(ref e) => e.description(),
-            Error::UnexpectedNetworkMagic { .. } => "unexpected network magic",
-            Error::OversizedVectorAllocation { .. } => "allocation of oversized vector requested",
-            Error::InvalidChecksum { .. } => "invalid checksum",
-            Error::UnknownNetworkMagic(..) => "unknown network magic",
-            Error::ParseFailed(..) => "parse failed",
-            Error::UnsupportedSegwitFlag(..) => "unsupported segwit version",
-            Error::UnrecognizedNetworkCommand(..) => "unrecognized network command",
-            Error::UnexpectedHexDigit(..) => "unexpected hex digit",
-        }
+        "Bitcoin encoding error"
     }
 }
 
 #[doc(hidden)]
-impl From<base58::Error> for Error {
-    fn from(e: base58::Error) -> Error {
-        Error::Base58(e)
-    }
-}
-
-#[doc(hidden)]
-impl From<secp256k1::Error> for Error {
-    fn from(e: secp256k1::Error) -> Error {
-        Error::Secp256k1(e)
-    }
-}
 
 #[doc(hidden)]
 impl From<io::Error> for Error {
@@ -189,7 +156,7 @@ pub fn serialize<T: Encodable + ?Sized>(data: &T) -> Vec<u8> {
 
 /// Encode an object into a hex-encoded string
 pub fn serialize_hex<T: Encodable + ?Sized>(data: &T) -> String {
-    hex_encode(serialize(data))
+    serialize(data)[..].to_hex()
 }
 
 /// Deserialize an object from a vector, will error if said deserialization
@@ -276,39 +243,42 @@ macro_rules! encoder_fn {
     ($name:ident, $val_type:ty, $writefn:ident) => {
         #[inline]
         fn $name(&mut self, v: $val_type) -> Result<(), Error> {
-            WriteBytesExt::$writefn::<LittleEndian>(self, v).map_err(Error::Io)
+            self.write_all(&endian::$writefn(v)).map_err(Error::Io)
         }
     }
 }
 
 macro_rules! decoder_fn {
-    ($name:ident, $val_type:ty, $readfn:ident) => {
+    ($name:ident, $val_type:ty, $readfn:ident, $byte_len: expr) => {
         #[inline]
         fn $name(&mut self) -> Result<$val_type, Error> {
-            ReadBytesExt::$readfn::<LittleEndian>(self).map_err(Error::Io)
+            assert_eq!(::std::mem::size_of::<$val_type>(), $byte_len); // size_of isn't a constfn in 1.22
+            let mut val = [0; $byte_len];
+            self.read_exact(&mut val[..]).map_err(Error::Io)?;
+            Ok(endian::$readfn(&val))
         }
     }
 }
 
 impl<W: Write> WriteExt for W {
-    encoder_fn!(emit_u64, u64, write_u64);
-    encoder_fn!(emit_u32, u32, write_u32);
-    encoder_fn!(emit_u16, u16, write_u16);
-    encoder_fn!(emit_i64, i64, write_i64);
-    encoder_fn!(emit_i32, i32, write_i32);
-    encoder_fn!(emit_i16, i16, write_i16);
+    encoder_fn!(emit_u64, u64, u64_to_array_le);
+    encoder_fn!(emit_u32, u32, u32_to_array_le);
+    encoder_fn!(emit_u16, u16, u16_to_array_le);
+    encoder_fn!(emit_i64, i64, i64_to_array_le);
+    encoder_fn!(emit_i32, i32, i32_to_array_le);
+    encoder_fn!(emit_i16, i16, i16_to_array_le);
 
     #[inline]
     fn emit_i8(&mut self, v: i8) -> Result<(), Error> {
-        self.write_i8(v).map_err(Error::Io)
+        self.write_all(&[v as u8]).map_err(Error::Io)
     }
     #[inline]
     fn emit_u8(&mut self, v: u8) -> Result<(), Error> {
-        self.write_u8(v).map_err(Error::Io)
+        self.write_all(&[v]).map_err(Error::Io)
     }
     #[inline]
     fn emit_bool(&mut self, v: bool) -> Result<(), Error> {
-        self.write_i8(if v {1} else {0}).map_err(Error::Io)
+        self.write_all(&[if v {1} else {0}]).map_err(Error::Io)
     }
     #[inline]
     fn emit_slice(&mut self, v: &[u8]) -> Result<(), Error> {
@@ -317,20 +287,24 @@ impl<W: Write> WriteExt for W {
 }
 
 impl<R: Read> ReadExt for R {
-    decoder_fn!(read_u64, u64, read_u64);
-    decoder_fn!(read_u32, u32, read_u32);
-    decoder_fn!(read_u16, u16, read_u16);
-    decoder_fn!(read_i64, i64, read_i64);
-    decoder_fn!(read_i32, i32, read_i32);
-    decoder_fn!(read_i16, i16, read_i16);
+    decoder_fn!(read_u64, u64, slice_to_u64_le, 8);
+    decoder_fn!(read_u32, u32, slice_to_u32_le, 4);
+    decoder_fn!(read_u16, u16, slice_to_u16_le, 2);
+    decoder_fn!(read_i64, i64, slice_to_i64_le, 8);
+    decoder_fn!(read_i32, i32, slice_to_i32_le, 4);
+    decoder_fn!(read_i16, i16, slice_to_i16_le, 2);
 
     #[inline]
     fn read_u8(&mut self) -> Result<u8, Error> {
-        ReadBytesExt::read_u8(self).map_err(Error::Io)
+        let mut slice = [0u8; 1];
+        self.read_exact(&mut slice)?;
+        Ok(slice[0])
     }
     #[inline]
     fn read_i8(&mut self) -> Result<i8, Error> {
-        ReadBytesExt::read_i8(self).map_err(Error::Io)
+        let mut slice = [0u8; 1];
+        self.read_exact(&mut slice)?;
+        Ok(slice[0] as i8)
     }
     #[inline]
     fn read_bool(&mut self) -> Result<bool, Error> {
@@ -343,7 +317,7 @@ impl<R: Read> ReadExt for R {
 }
 
 /// Maximum size, in bytes, of a vector we are allowed to decode
-pub const MAX_VEC_SIZE: usize = 32 * 1024 * 1024;
+pub const MAX_VEC_SIZE: usize = 4_000_000;
 
 /// Data which can be encoded in a consensus-consistent way
 pub trait Encodable {
@@ -449,7 +423,7 @@ impl Decodable for VarInt {
             0xFF => {
                 let x = ReadExt::read_u64(&mut d)?;
                 if x < 0x100000000 {
-                    Err(self::Error::ParseFailed("non-minimal varint"))
+                    Err(self::Error::NonMinimalVarInt)
                 } else {
                     Ok(VarInt(x))
                 }
@@ -457,7 +431,7 @@ impl Decodable for VarInt {
             0xFE => {
                 let x = ReadExt::read_u32(&mut d)?;
                 if x < 0x10000 {
-                    Err(self::Error::ParseFailed("non-minimal varint"))
+                    Err(self::Error::NonMinimalVarInt)
                 } else {
                     Ok(VarInt(x as u64))
                 }
@@ -465,7 +439,7 @@ impl Decodable for VarInt {
             0xFD => {
                 let x = ReadExt::read_u16(&mut d)?;
                 if x < 0xFD {
-                    Err(self::Error::ParseFailed("non-minimal varint"))
+                    Err(self::Error::NonMinimalVarInt)
                 } else {
                     Ok(VarInt(x as u64))
                 }
@@ -508,6 +482,26 @@ impl Decodable for String {
     fn consensus_decode<D: io::Read>(d: D) -> Result<String, Error> {
         String::from_utf8(Decodable::consensus_decode(d)?)
             .map_err(|_| self::Error::ParseFailed("String was not valid UTF8"))
+    }
+}
+
+// Cow<'static, str>
+impl Encodable for Cow<'static, str> {
+    #[inline]
+    fn consensus_encode<S: io::Write>(&self, mut s: S) -> Result<usize, Error> {
+        let b = self.as_bytes();
+        let vi_len = VarInt(b.len() as u64).consensus_encode(&mut s)?;
+        s.emit_slice(&b)?;
+        Ok(vi_len + b.len())
+    }
+}
+
+impl Decodable for Cow<'static, str> {
+    #[inline]
+    fn consensus_decode<D: io::Read>(d: D) -> Result<Cow<'static, str>, Error> {
+        String::from_utf8(Decodable::consensus_decode(d)?)
+            .map_err(|_| self::Error::ParseFailed("String was not valid UTF8"))
+            .map(Cow::Owned)
     }
 }
 
@@ -601,7 +595,9 @@ macro_rules! impl_vec {
         }
     }
 }
-impl_vec!(sha256d::Hash);
+impl_vec!(BlockHash);
+impl_vec!(FilterHash);
+impl_vec!(TxMerkleNode);
 impl_vec!(Transaction);
 impl_vec!(TxOut);
 impl_vec!(TxIn);
@@ -660,7 +656,7 @@ impl Decodable for Box<[u8]> {
 
 /// Do a double-SHA256 on some data and return the first 4 bytes
 fn sha2_checksum(data: &[u8]) -> [u8; 4] {
-    let checksum = <sha256d::Hash as HashTrait>::hash(data);
+    let checksum = <sha256d::Hash as Hash>::hash(data);
     [checksum[0], checksum[1], checksum[2], checksum[3]]
 }
 
@@ -741,8 +737,7 @@ impl Encodable for sha256d::Hash {
 
 impl Decodable for sha256d::Hash {
     fn consensus_decode<D: io::Read>(d: D) -> Result<Self, Error> {
-        let inner = <[u8; 32]>::consensus_decode(d)?;
-        Ok(sha256d::Hash::from_slice(&inner).unwrap())
+        Ok(Self::from_inner(<<Self as Hash>::Inner>::consensus_decode(d)?))
     }
 }
 
@@ -815,27 +810,27 @@ mod tests {
     #[test]
     fn deserialize_nonminimal_vec() {
         match deserialize::<Vec<u8>>(&[0xfd, 0x00, 0x00]) {
-            Err(Error::ParseFailed("non-minimal varint")) => {},
+            Err(Error::NonMinimalVarInt) => {},
             x => panic!(x)
         }
         match deserialize::<Vec<u8>>(&[0xfd, 0xfc, 0x00]) {
-            Err(Error::ParseFailed("non-minimal varint")) => {},
+            Err(Error::NonMinimalVarInt) => {},
             x => panic!(x)
         }
         match deserialize::<Vec<u8>>(&[0xfe, 0xff, 0x00, 0x00, 0x00]) {
-            Err(Error::ParseFailed("non-minimal varint")) => {},
+            Err(Error::NonMinimalVarInt) => {},
             x => panic!(x)
         }
         match deserialize::<Vec<u8>>(&[0xfe, 0xff, 0xff, 0x00, 0x00]) {
-            Err(Error::ParseFailed("non-minimal varint")) => {},
+            Err(Error::NonMinimalVarInt) => {},
             x => panic!(x)
         }
         match deserialize::<Vec<u8>>(&[0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]) {
-            Err(Error::ParseFailed("non-minimal varint")) => {},
+            Err(Error::NonMinimalVarInt) => {},
             x => panic!(x)
         }
         match deserialize::<Vec<u8>>(&[0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00]) {
-            Err(Error::ParseFailed("non-minimal varint")) => {},
+            Err(Error::NonMinimalVarInt) => {},
             x => panic!(x)
         }
 
@@ -922,6 +917,10 @@ mod tests {
     #[test]
     fn deserialize_strbuf_test() {
         assert_eq!(deserialize(&[6u8, 0x41, 0x6e, 0x64, 0x72, 0x65, 0x77]).ok(), Some("Andrew".to_string()));
+        assert_eq!(
+            deserialize(&[6u8, 0x41, 0x6e, 0x64, 0x72, 0x65, 0x77]).ok(),
+            Some(::std::borrow::Cow::Borrowed("Andrew"))
+        );
     }
 
     #[test]

@@ -45,6 +45,11 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+// In general, rust is absolutely horrid at supporting users doing things like,
+// for example, compiling Rust code for real environments. Disable useless lints
+// that don't do anything but annoy us and cant actually ever be resolved.
+#![allow(bare_trait_objects)]
+#![allow(ellipsis_inclusive_range_patterns)]
 
 // Re-exported dependencies.
 pub extern crate bitcoin;
@@ -52,8 +57,7 @@ pub use bitcoin::hashes;
 pub use bitcoin::secp256k1;
 pub use bitcoin::bech32;
 
-extern crate byteorder;
-extern crate hex;
+#[cfg(any(test, feature = "serde"))] extern crate hex;
 #[cfg(feature = "serde")] extern crate serde;
 #[cfg(all(test, feature = "serde"))] #[macro_use] extern crate serde_derive; // for 1.22.0 compat
 #[cfg(all(test, feature = "serde"))] extern crate serde_json;
@@ -74,7 +78,11 @@ pub mod network;
 pub mod blockdata;
 pub mod util;
 pub mod consensus;
+// Do not remove: required in order to get hash types implementation macros to work correctly
+#[allow(unused_imports)]
+pub mod hash_types;
 
+pub use hash_types::*;
 pub use blockdata::block::Block;
 pub use blockdata::block::BlockHeader;
 pub use blockdata::script::Script;

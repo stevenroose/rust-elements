@@ -53,7 +53,7 @@ pub struct PartiallySignedTransaction {
 impl PartiallySignedTransaction {
     /// Create a PartiallySignedTransaction from an unsigned transaction, error
     /// if not unsigned
-    pub fn from_unsigned_tx(tx: Transaction) -> Result<Self, encode::Error> {
+    pub fn from_unsigned_tx(tx: Transaction) -> Result<Self, self::Error> {
         Ok(PartiallySignedTransaction {
             inputs: vec![Default::default(); tx.input.len()],
             outputs: vec![Default::default(); tx.output.len()],
@@ -163,7 +163,7 @@ impl Decodable for PartiallySignedTransaction {
 #[cfg(test)]
 mod tests {
     use hashes::hex::FromHex;
-    use hashes::sha256d;
+    use hash_types::Txid;
 
     use std::collections::BTreeMap;
 
@@ -256,7 +256,7 @@ mod tests {
                 lock_time: 1257139,
                 input: vec![TxIn {
                     previous_output: OutPoint {
-                        txid: sha256d::Hash::from_hex(
+                        txid: Txid::from_hex(
                             "f61b1742ca13176464adb3cb66050c00787bb3a4eead37e985f2df1e37718126",
                         ).unwrap(),
                         vout: 0,
