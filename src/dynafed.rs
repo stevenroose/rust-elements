@@ -14,7 +14,7 @@
 
 //! Dynamic Federations
 
-use std::io;
+use std::{fmt, io};
 
 use bitcoin::hashes::{Hash, sha256, sha256d};
 #[cfg(feature = "serde")] use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -24,7 +24,7 @@ use encode::{self, Encodable, Decodable};
 use Script;
 
 /// Dynamic federations paramaters, as encoded in a block header
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub enum Params {
     /// Null entry, used to signal "no vote" as a proposal
     Null,
@@ -54,6 +54,52 @@ pub enum Params {
         /// "Extension space" used by Liquid for PAK key entries
         extension_space: Vec<Vec<u8>>,
     },
+}
+
+impl fmt::Debug for Params {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // Null and Compact have nice Debug formats, but Full has these annoying Vec's.
+        // For Full, we write the witness as hex and the `fedpegscript` as [Script].
+        match self {
+            Params::Null => write!(f, "Null"),
+            Params::Compact { signblockscript, signblock_witness_limit, elided_root } => {
+                let mut s = f.debug_struct("Compact");
+                s.field("signblockscript", signblockscript);
+                s.field("signblock_witness_limit", signblock_witness_limit);
+                s.field("elided_root", elided_root);
+                s.finish()
+            }
+            Params::Full {
+                signblockscript,
+                signblock_witness_limit,
+                fedpeg_program,
+                fedpegscript,
+                extension_space,
+            } => {
+                let mut s = f.debug_struct("Full");
+                s.field("signblockscript", signblockscript);
+                s.field("signblock_witness_limit", signblock_witness_limit);
+                s.field("fedpeg_program", fedpeg_program);
+                //TODO(stevenroose) improve this after https://github.com/rust-bitcoin/rust-bitcoin/pull/569
+                s.field("fedpegscript", &Script::from(fedpegscript.clone()));
+                struct HexArray<'a>(&'a [Vec<u8>]);
+                impl<'a> fmt::Debug for HexArray<'a> {
+                    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        write!(f, "[")?;
+                        for (i, e) in self.0.iter().enumerate() {
+                            if i != 0 {
+                                write!(f, " ")?;
+                            }
+                            bitcoin::hashes::hex::format_hex(&e[..], f)?;
+                        }
+                        write!(f, "]")
+                    }
+                }
+                s.field("extension_space", &HexArray(&extension_space));
+                s.finish()
+            }
+        }
+    }
 }
 
 impl Params {
